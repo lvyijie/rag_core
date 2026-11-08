@@ -1,2 +1,34 @@
+# Build directories
 build/
+cmake-build-*/
+out/
+
+# Compiled binaries & artifacts
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Generated corpus & index snapshots
+*.bin
+*.vidx
+test_txt/
+
+# IDE & Editor files
+.vscode/
+.idea/
+.vs/
 compile_commands.json
+*.swp
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/

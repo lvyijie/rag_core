@@ -3,11 +3,18 @@
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include "../include/vrag.hpp"
 
 using namespace vrag;
 
 int main(int argc, char* argv[]) {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
     if (argc < 2) {
         std::cout << "用法: " << argv[0] << " <corpus.bin> [压测查询轮数(默认100)]\n";
         return 1;
@@ -32,13 +39,13 @@ int main(int argc, char* argv[]) {
     std::cout << "[+] 加载完成！文档总数: " << engine.total_docs() 
               << "，耗时: " << load_sec << " 秒\n\n";
 
-    // 构造一些真实的混合测试 Query
+    // 构造真实的混合测试 Query（覆盖简繁体四大名著经典桥段）
     std::vector<std::string> test_queries = {
-        "賈寶玉銜玉而誕",
-        "冷子興演說榮國府衰敗",
-        "太虛幻境甄士隱夢醒",
-        "無材補天幻形入世",
-        "百足之蟲死而不僵"
+        "贾宝玉神游太虚幻境",
+        "冷子兴演说荣国府衰败",
+        "诸葛亮草船借箭孔明奇计",
+        "孙悟空大闹天宫齐天大圣",
+        "鲁智深倒拔垂杨柳武松打虎"
     };
 
     // 构造 1024 维归一化查询向量

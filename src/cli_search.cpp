@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -6,58 +7,105 @@
 #include <vector>
 #include <array>
 #include <memory>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include "../include/vrag.hpp"
 
 using namespace vrag;
 
-// 调用系统的 curl 获取 query 的 1024 维实时向量
+namespace {
+
+std::string json_escape(std::string_view input) {
+    std::string out;
+    out.reserve(input.size() + 16);
+    for (unsigned char c : input) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c >= 0x20) {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+// 调用系统的 curl 获取 query 的 1024 维实时向量（通过 stdin 传递 JSON 避免命令行注入与引号转义问题）
 bool fetch_query_embedding(const std::string& query, std::vector<float>& out_vec) {
     const char* api_key = std::getenv("EMBED_API_KEY");
     if (!api_key || std::string(api_key).empty()) {
         return false;
     }
 
-    // 简单转义双引号
-    std::string safe_query;
-    for (char c : query) {
-        if (c == '"') safe_query += "\\\"";
-        else safe_query += c;
+    const std::string payload = "{\"model\":\"BAAI/bge-m3\",\"input\":[\"" + json_escape(query) + "\"]}";
+    const std::string temp_file = "vrag_query_payload.tmp.json";
+    {
+        std::ofstream ofs(temp_file, std::ios::binary);
+        if (!ofs.is_open()) return false;
+        ofs.write(payload.data(), static_cast<std::streamsize>(payload.size()));
     }
 
     std::string cmd = "curl -s -X POST https://api.siliconflow.cn/v1/embeddings "
                       "-H \"Authorization: Bearer " + std::string(api_key) + "\" "
                       "-H \"Content-Type: application/json\" "
-                      "-d '{\"model\": \"BAAI/bge-m3\", \"input\": [\"" + safe_query + "\"]}'";
+                      "--data-binary @" + temp_file;
 
-    std::array<char, 4096> buffer;
+    std::array<char, 4096> buffer{};
     std::string response;
+#if defined(_WIN32)
+    std::unique_ptr<FILE, decltype(&_pclose)> pipe(_popen(cmd.c_str(), "r"), _pclose);
+#else
     std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) return false;
-
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        response += buffer.data();
+#endif
+    if (!pipe) {
+        std::remove(temp_file.c_str());
+        return false;
     }
 
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
+        response += buffer.data();
+    }
+    std::remove(temp_file.c_str());
+
     // 极速解析 JSON 中的 embedding 浮点数数组
-    auto pos = response.find("\"embedding\":[");
+    auto pos = response.find("\"embedding\":");
     if (pos == std::string::npos) return false;
-    pos += 13;
+    pos = response.find('[', pos);
+    if (pos == std::string::npos) return false;
+    ++pos;
 
     out_vec.clear();
+    out_vec.reserve(1024);
     while (pos < response.size() && response[pos] != ']') {
-        while (pos < response.size() && (response[pos] == ' ' || response[pos] == ',')) pos++;
-        if (response[pos] == ']') break;
+        while (pos < response.size() && (response[pos] == ' ' || response[pos] == ',' || response[pos] == '\n' || response[pos] == '\r')) {
+            pos++;
+        }
+        if (pos >= response.size() || response[pos] == ']') break;
         char* end_ptr = nullptr;
         float val = std::strtof(&response[pos], &end_ptr);
         if (&response[pos] == end_ptr) break;
         out_vec.push_back(val);
-        pos = end_ptr - &response[0];
+        pos = static_cast<std::size_t>(end_ptr - &response[0]);
     }
 
     return out_vec.size() == 1024;
 }
 
 int main(int argc, char* argv[]) {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
     if (argc < 2) {
         std::cout << "使用方法: " << argv[0] << " <knowledge_base.bin>\n";
         return 1;

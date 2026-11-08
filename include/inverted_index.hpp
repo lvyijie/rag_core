@@ -1,8 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <istream>
+#include <mutex>
+#include <ostream>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -28,112 +32,441 @@ struct SearchHit {
 
 class InvertedIndex {
 public:
-    InvertedIndex() = default;
+    InvertedIndex() {
+        index_.reserve(16384);
+        scratch_terms_.reserve(512);
+    }
 
-    // 索引一篇新文档 (text 为原始内容，doc_id 为文档唯一标号)
-    void add_document(std::uint32_t doc_id, std::string_view text) {
-        // 1. 统计当前文档中各个 Bi-gram 的本地词频 (Local Term Frequency)
-        std::unordered_map<std::uint32_t, std::uint16_t> local_tf;
-        std::uint32_t token_count = 0;
+    InvertedIndex(const InvertedIndex&) = delete;
+    InvertedIndex& operator=(const InvertedIndex&) = delete;
 
-        auto tokens = Tokenizer::cut(text);
-        for (std::string_view token : tokens) {
-            std::uint32_t term_id = fnv1a_hash(token);
-            local_tf[term_id]++;
-            token_count++;
+    InvertedIndex(InvertedIndex&& other) noexcept
+        : index_(std::move(other.index_)),
+          doc_lengths_(std::move(other.doc_lengths_)),
+          doc_present_(std::move(other.doc_present_)),
+          doc_deleted_(std::move(other.doc_deleted_)),
+          total_docs_(other.total_docs_),
+          total_tokens_(other.total_tokens_),
+          has_deletions_(other.has_deletions_),
+          scratch_terms_(std::move(other.scratch_terms_)),
+          doc_k_(std::move(other.doc_k_)),
+          doc_norm_tf1_(std::move(other.doc_norm_tf1_)),
+          cached_k1_(other.cached_k1_),
+          cached_b_(other.cached_b_),
+          norms_dirty_(other.norms_dirty_.load(std::memory_order_relaxed)) {}
+
+    InvertedIndex& operator=(InvertedIndex&& other) noexcept {
+        if (this != &other) {
+            index_ = std::move(other.index_);
+            doc_lengths_ = std::move(other.doc_lengths_);
+            doc_present_ = std::move(other.doc_present_);
+            doc_deleted_ = std::move(other.doc_deleted_);
+            total_docs_ = other.total_docs_;
+            total_tokens_ = other.total_tokens_;
+            has_deletions_ = other.has_deletions_;
+            scratch_terms_ = std::move(other.scratch_terms_);
+            doc_k_ = std::move(other.doc_k_);
+            doc_norm_tf1_ = std::move(other.doc_norm_tf1_);
+            cached_k1_ = other.cached_k1_;
+            cached_b_ = other.cached_b_;
+            norms_dirty_.store(other.norms_dirty_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
+        return *this;
+    }
+
+    void reserve_docs(std::size_t doc_count) {
+        doc_lengths_.reserve(doc_count);
+        doc_present_.reserve(doc_count);
+        doc_deleted_.reserve(doc_count);
+        doc_k_.reserve(doc_count);
+        doc_norm_tf1_.reserve(doc_count);
+    }
+
+    // 软删除指定文档（O(1) 墓碑标记，立即对后续查询生效）
+    bool remove_document(std::uint32_t doc_id) {
+        if (doc_id >= doc_present_.size() || !doc_present_[doc_id] || doc_deleted_[doc_id]) {
+            return false;
+        }
+        doc_deleted_[doc_id] = 1;
+        has_deletions_ = true;
+        if (total_tokens_ >= doc_lengths_[doc_id]) {
+            total_tokens_ -= doc_lengths_[doc_id];
+        } else {
+            total_tokens_ = 0;
+        }
+        doc_lengths_[doc_id] = 0;
+        if (total_docs_ > 0) {
+            --total_docs_;
+        }
+        norms_dirty_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    // 索引一篇新文档 (text 为原始内容，doc_id 为内部槽位号或文档唯一标号)
+    void add_document(std::uint32_t doc_id, std::string_view text) {
+        // 若同一 doc_id 已存在且未删除，先清理其旧倒排项以保证幂等更新
+        if (doc_id < doc_present_.size() && doc_present_[doc_id]) {
+            if (!doc_deleted_[doc_id]) {
+                if (total_tokens_ >= doc_lengths_[doc_id]) {
+                    total_tokens_ -= doc_lengths_[doc_id];
+                }
+                if (total_docs_ > 0) {
+                    --total_docs_;
+                }
+            }
+            for (auto& [term_id, plist] : index_) {
+                plist.erase(
+                    std::remove_if(plist.begin(), plist.end(),
+                                   [doc_id](const PostingEntry& e) noexcept { return e.doc_id == doc_id; }),
+                    plist.end());
+            }
+            doc_deleted_[doc_id] = 0;
+        }
+
+        // 1. 使用复用缓冲区 + 排序归并统计本地词频 (消除每篇文档的 unordered_map 堆分配)
+        scratch_terms_.clear();
+        for (std::string_view token : Tokenizer::cut(text)) {
+            scratch_terms_.push_back(fnv1a_hash(token));
+        }
+
+        const std::uint32_t token_count = static_cast<std::uint32_t>(scratch_terms_.size());
 
         // 2. 记录文档长度元数据
         if (doc_id >= doc_lengths_.size()) {
             doc_lengths_.resize(doc_id + 1, 0);
+            doc_present_.resize(doc_id + 1, 0);
+            doc_deleted_.resize(doc_id + 1, 0);
         }
         doc_lengths_[doc_id] = token_count;
+        doc_present_[doc_id] = 1;
+        doc_deleted_[doc_id] = 0;
         total_tokens_ += token_count;
         total_docs_++;
+        norms_dirty_.store(true, std::memory_order_release);
 
-        // 3. 追加写入全局倒排链表
-        for (const auto& [term_id, tf] : local_tf) {
+        if (scratch_terms_.empty()) {
+            return;
+        }
+
+        std::sort(scratch_terms_.begin(), scratch_terms_.end());
+
+        // 3. 游程编码统计词频并追加写入全局倒排链表
+        std::size_t i = 0;
+        const std::size_t n = scratch_terms_.size();
+        while (i < n) {
+            const std::uint32_t term_id = scratch_terms_[i];
+            std::size_t j = i + 1;
+            while (j < n && scratch_terms_[j] == term_id) {
+                ++j;
+            }
+            const auto tf = static_cast<std::uint16_t>(
+                std::min<std::size_t>(j - i, 65535u)
+            );
             index_[term_id].push_back(PostingEntry{doc_id, tf});
+            i = j;
         }
     }
 
-    // 基于标准 BM25 算法进行字面检索打分
-    // k1 = 1.2f, b = 0.75f 为通用信息检索领域最优默认经验值
-    std::vector<SearchHit> search_bm25(std::string_view query, std::size_t top_k = 10,
-                                       float k1 = 1.2f, float b = 0.75f) const {
-        if (total_docs_ == 0 || query.empty()) {
-            return {};
+    // 线程安全 + 零堆分配热路径：将 BM25 Top-K 结果直接写入调用方提供的复用容器
+    void search_bm25_into(std::string_view query, std::size_t top_k,
+                          std::vector<SearchHit>& results,
+                          float k1 = 1.2f, float b = 0.75f) const {
+        results.clear();
+        if (total_docs_ == 0 || query.empty() || top_k == 0) {
+            return;
         }
 
-        const float avgdl = static_cast<float>(total_tokens_) / static_cast<float>(total_docs_);
+        // 线程局部查询工作区：多线程并发调用 search 时无锁且零数据竞争，单线程复用时零堆分配
+        thread_local ThreadWorkspace tls;
 
-        // 1. 提取 Query 的词项与词频
-        std::unordered_map<std::uint32_t, std::uint16_t> query_tf;
-        auto tokens = Tokenizer::cut(query);
-        for (std::string_view token : tokens) {
-            std::uint32_t term_id = fnv1a_hash(token);
-            query_tf[term_id]++;
+        // 1. 提取并去重 Query 的词项
+        tls.query_terms.clear();
+        for (std::string_view token : Tokenizer::cut(query)) {
+            tls.query_terms.push_back(fnv1a_hash(token));
+        }
+        if (tls.query_terms.empty()) {
+            return;
+        }
+        std::sort(tls.query_terms.begin(), tls.query_terms.end());
+        tls.query_terms.erase(std::unique(tls.query_terms.begin(), tls.query_terms.end()),
+                              tls.query_terms.end());
+
+        // 2. 双重检查锁定惰性更新 BM25 长度归一化表（热路径仅单次原子读取，无锁开销）
+        if (norms_dirty_.load(std::memory_order_acquire) || cached_k1_ != k1 || cached_b_ != b) {
+            std::lock_guard<std::mutex> lock(norm_mutex_);
+            if (norms_dirty_.load(std::memory_order_relaxed) || cached_k1_ != k1 || cached_b_ != b) {
+                rebuild_norm_cache_locked(k1, b);
+            }
         }
 
-        // 2. 累加各匹配文档的 BM25 分数
-        std::unordered_map<std::uint32_t, float> doc_scores;
+        const std::size_t max_slot = doc_lengths_.size();
+        if (tls.score_buf.size() < max_slot) {
+            tls.score_buf.resize(max_slot, -1.0f);
+        }
 
-        for (const auto& [term_id, q_tf] : query_tf) {
+        // 3. 使用线程局部扁平数组 score_buf + touched_docs 累加 BM25 分数
+        tls.touched_docs.clear();
+        const float* __restrict doc_k = doc_k_.data();
+        const float* __restrict norm_tf1 = doc_norm_tf1_.data();
+        const std::uint8_t* __restrict deleted = doc_deleted_.data();
+        const bool check_del = has_deletions_;
+        float* __restrict scores = tls.score_buf.data();
+
+        for (std::uint32_t term_id : tls.query_terms) {
             auto it = index_.find(term_id);
             if (it == index_.end()) {
-                continue; // 当前词未在任何文档中出现
+                continue;
             }
 
             const auto& postings = it->second;
-            std::size_t df = postings.size(); // 包含该词的文档数 (Document Frequency)
+            const std::size_t df = postings.size();
+            if (df == 0) {
+                continue;
+            }
 
-            // 计算 IDF (逆文档频率，采用 Lucene 平滑公式)
-            float idf = std::log(1.0f + (static_cast<float>(total_docs_ - df) + 0.5f) /
-                                           (static_cast<float>(df) + 0.5f));
+            // 计算 IDF (Lucene 平滑公式)
+            const std::size_t eff_df = std::min(df, total_docs_);
+            float idf = std::log(1.0f + (static_cast<float>(total_docs_ - eff_df) + 0.5f) /
+                                           (static_cast<float>(eff_df) + 0.5f));
             if (idf < 0.0f) {
                 idf = 0.0f;
             }
 
-            // 遍历包含该词的倒排链表并累加贡献
-            for (const auto& entry : postings) {
-                float tf = static_cast<float>(entry.tf);
-                float doc_len = static_cast<float>(doc_lengths_[entry.doc_id]);
+            const float idf_k1 = idf * (k1 + 1.0f);
+            const PostingEntry* __restrict p_data = postings.data();
+            const std::size_t p_size = postings.size();
 
-                // BM25 核心词频归一化公式
-                float tf_norm = (tf * (k1 + 1.0f)) / (tf + k1 * (1.0f - b + b * (doc_len / avgdl)));
-                doc_scores[entry.doc_id] += idf * tf_norm;
+            if (!check_del) {
+                for (std::size_t idx = 0; idx < p_size; ++idx) {
+                    const std::uint32_t doc_id = p_data[idx].doc_id;
+                    const std::uint16_t raw_tf = p_data[idx].tf;
+
+                    float delta;
+                    if (raw_tf == 1) {
+                        delta = idf * norm_tf1[doc_id];
+                    } else {
+                        const float tf = static_cast<float>(raw_tf);
+                        delta = (idf_k1 * tf) / (tf + doc_k[doc_id]);
+                    }
+
+                    float cur = scores[doc_id];
+                    if (cur < 0.0f) {
+                        tls.touched_docs.push_back(doc_id);
+                        cur = 0.0f;
+                    }
+                    scores[doc_id] = cur + delta;
+                }
+            } else {
+                for (std::size_t idx = 0; idx < p_size; ++idx) {
+                    const std::uint32_t doc_id = p_data[idx].doc_id;
+                    if (deleted[doc_id]) {
+                        continue;
+                    }
+                    const std::uint16_t raw_tf = p_data[idx].tf;
+
+                    float delta;
+                    if (raw_tf == 1) {
+                        delta = idf * norm_tf1[doc_id];
+                    } else {
+                        const float tf = static_cast<float>(raw_tf);
+                        delta = (idf_k1 * tf) / (tf + doc_k[doc_id]);
+                    }
+
+                    float cur = scores[doc_id];
+                    if (cur < 0.0f) {
+                        tls.touched_docs.push_back(doc_id);
+                        cur = 0.0f;
+                    }
+                    scores[doc_id] = cur + delta;
+                }
             }
         }
 
-        // 3. 收集并排序打分结果
+        // 4. 基于小顶堆阈值过滤收集 Top-K 命中的文档分数并原地复位 score_buf
+        auto cmp = [](const SearchHit& a, const SearchHit& b) noexcept {
+            return (a.score != b.score) ? (a.score > b.score) : (a.doc_id < b.doc_id);
+        };
+        results.reserve(std::min(tls.touched_docs.size(), top_k));
+        float min_top_score = -1e30f;
+
+        for (std::uint32_t doc_id : tls.touched_docs) {
+            const float s = scores[doc_id];
+            scores[doc_id] = -1.0f;
+
+            if (results.size() < top_k) {
+                results.push_back(SearchHit{doc_id, s});
+                if (results.size() == top_k) {
+                    std::make_heap(results.begin(), results.end(), cmp);
+                    min_top_score = results[0].score;
+                }
+            } else if (s > min_top_score || (s == min_top_score && doc_id < results[0].doc_id)) {
+                std::pop_heap(results.begin(), results.end(), cmp);
+                results.back() = SearchHit{doc_id, s};
+                std::push_heap(results.begin(), results.end(), cmp);
+                min_top_score = results[0].score;
+            }
+        }
+
+        if (results.size() == top_k) {
+            std::sort_heap(results.begin(), results.end(), cmp);
+        } else {
+            std::sort(results.begin(), results.end(), cmp);
+        }
+    }
+
+    // 基于标准 BM25 算法进行字面检索打分（线程安全 const 方法）
+    std::vector<SearchHit> search_bm25(std::string_view query, std::size_t top_k = 10,
+                                       float k1 = 1.2f, float b = 0.75f) const {
         std::vector<SearchHit> results;
-        results.reserve(doc_scores.size());
-        for (const auto& [doc_id, score] : doc_scores) {
-            results.push_back(SearchHit{doc_id, score});
-        }
-
-        // 降序排序
-        std::sort(results.begin(), results.end(), [](const SearchHit& a, const SearchHit& b) {
-            return a.score > b.score;
-        });
-
-        if (results.size() > top_k) {
-            results.resize(top_k);
-        }
-
+        search_bm25_into(query, top_k, results, k1, b);
         return results;
+    }
+
+    // 序列化倒排索引至输出流
+    bool save(std::ostream& os) const {
+        const std::uint64_t slots = doc_lengths_.size();
+        const std::uint64_t docs = total_docs_;
+        const std::uint64_t tokens = total_tokens_;
+        const std::uint8_t has_del = has_deletions_ ? 1 : 0;
+        const std::uint64_t vocab = index_.size();
+
+        os.write(reinterpret_cast<const char*>(&slots), sizeof(slots));
+        os.write(reinterpret_cast<const char*>(&docs), sizeof(docs));
+        os.write(reinterpret_cast<const char*>(&tokens), sizeof(tokens));
+        os.write(reinterpret_cast<const char*>(&has_del), sizeof(has_del));
+        os.write(reinterpret_cast<const char*>(&vocab), sizeof(vocab));
+
+        if (slots > 0) {
+            os.write(reinterpret_cast<const char*>(doc_lengths_.data()), slots * sizeof(std::uint32_t));
+            os.write(reinterpret_cast<const char*>(doc_present_.data()), slots * sizeof(std::uint8_t));
+            os.write(reinterpret_cast<const char*>(doc_deleted_.data()), slots * sizeof(std::uint8_t));
+        }
+
+        for (const auto& [term_id, postings] : index_) {
+            const std::uint32_t p_len = static_cast<std::uint32_t>(postings.size());
+            os.write(reinterpret_cast<const char*>(&term_id), sizeof(term_id));
+            os.write(reinterpret_cast<const char*>(&p_len), sizeof(p_len));
+            if (p_len > 0) {
+                os.write(reinterpret_cast<const char*>(postings.data()), p_len * sizeof(PostingEntry));
+            }
+        }
+        return static_cast<bool>(os);
+    }
+
+    // 从输入流极速反序列化倒排索引（免分词直接挂载）
+    bool load(std::istream& is) {
+        std::uint64_t slots = 0;
+        std::uint64_t docs = 0;
+        std::uint64_t tokens = 0;
+        std::uint8_t has_del = 0;
+        std::uint64_t vocab = 0;
+
+        if (!is.read(reinterpret_cast<char*>(&slots), sizeof(slots)) ||
+            !is.read(reinterpret_cast<char*>(&docs), sizeof(docs)) ||
+            !is.read(reinterpret_cast<char*>(&tokens), sizeof(tokens)) ||
+            !is.read(reinterpret_cast<char*>(&has_del), sizeof(has_del)) ||
+            !is.read(reinterpret_cast<char*>(&vocab), sizeof(vocab))) {
+            return false;
+        }
+
+        total_docs_ = static_cast<std::size_t>(docs);
+        total_tokens_ = static_cast<std::size_t>(tokens);
+        has_deletions_ = (has_del != 0);
+
+        doc_lengths_.resize(static_cast<std::size_t>(slots));
+        doc_present_.resize(static_cast<std::size_t>(slots));
+        doc_deleted_.resize(static_cast<std::size_t>(slots));
+
+        if (slots > 0) {
+            is.read(reinterpret_cast<char*>(doc_lengths_.data()), slots * sizeof(std::uint32_t));
+            is.read(reinterpret_cast<char*>(doc_present_.data()), slots * sizeof(std::uint8_t));
+            is.read(reinterpret_cast<char*>(doc_deleted_.data()), slots * sizeof(std::uint8_t));
+        }
+
+        index_.clear();
+        index_.reserve(static_cast<std::size_t>(vocab));
+        for (std::uint64_t i = 0; i < vocab; ++i) {
+            std::uint32_t term_id = 0;
+            std::uint32_t p_len = 0;
+            is.read(reinterpret_cast<char*>(&term_id), sizeof(term_id));
+            is.read(reinterpret_cast<char*>(&p_len), sizeof(p_len));
+            auto& vec = index_[term_id];
+            vec.resize(p_len);
+            if (p_len > 0) {
+                is.read(reinterpret_cast<char*>(vec.data()), p_len * sizeof(PostingEntry));
+            }
+        }
+
+        norms_dirty_.store(true, std::memory_order_release);
+        return static_cast<bool>(is);
+    }
+
+    void clear() {
+        index_.clear();
+        doc_lengths_.clear();
+        doc_present_.clear();
+        doc_deleted_.clear();
+        doc_k_.clear();
+        doc_norm_tf1_.clear();
+        total_docs_ = 0;
+        total_tokens_ = 0;
+        has_deletions_ = false;
+        norms_dirty_.store(true, std::memory_order_release);
     }
 
     [[nodiscard]] std::size_t total_docs() const noexcept { return total_docs_; }
     [[nodiscard]] std::size_t vocab_size() const noexcept { return index_.size(); }
 
 private:
-    // TermID (uint32_t) -> 紧凑倒排链表
+    struct ThreadWorkspace {
+        std::vector<std::uint32_t> query_terms;
+        std::vector<float> score_buf;
+        std::vector<std::uint32_t> touched_docs;
+
+        ThreadWorkspace() {
+            query_terms.reserve(64);
+            touched_docs.reserve(2048);
+        }
+    };
+
+    void rebuild_norm_cache_locked(float k1, float b) const {
+        const std::size_t n = doc_lengths_.size();
+        doc_k_.resize(n);
+        doc_norm_tf1_.resize(n);
+
+        const float avgdl = (total_docs_ > 0)
+            ? (static_cast<float>(total_tokens_) / static_cast<float>(total_docs_))
+            : 1.0f;
+        const float c0 = k1 * (1.0f - b);
+        const float c1 = (avgdl > 0.0f) ? (k1 * b / avgdl) : 0.0f;
+        const float k1_plus_1 = k1 + 1.0f;
+
+        for (std::size_t i = 0; i < n; ++i) {
+            const float K = c0 + c1 * static_cast<float>(doc_lengths_[i]);
+            doc_k_[i] = K;
+            doc_norm_tf1_[i] = k1_plus_1 / (1.0f + K);
+        }
+
+        cached_k1_ = k1;
+        cached_b_ = b;
+        norms_dirty_.store(false, std::memory_order_release);
+    }
+
     std::unordered_map<std::uint32_t, std::vector<PostingEntry>> index_;
-    // 各文档的词元总数 (以 DocID 为下标直接索引)
     std::vector<std::uint32_t> doc_lengths_;
+    std::vector<std::uint8_t> doc_present_;
+    std::vector<std::uint8_t> doc_deleted_;
     std::size_t total_docs_{0};
     std::size_t total_tokens_{0};
+    bool has_deletions_{false};
+
+    std::vector<std::uint32_t> scratch_terms_;
+    mutable std::mutex norm_mutex_;
+    mutable std::vector<float> doc_k_;
+    mutable std::vector<float> doc_norm_tf1_;
+    mutable float cached_k1_{1.2f};
+    mutable float cached_b_{0.75f};
+    mutable std::atomic<bool> norms_dirty_{true};
 };
 
 } // namespace vrag

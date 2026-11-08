@@ -82,14 +82,47 @@ int main() {
         );
     }
 
-    // 测试 5：非汉字字符（英文/标点隔离打断）
+    // 测试 5：中英混排（英文单词提取 + 打断前后汉字滑窗）
     {
         auto result = tokenizer.cut("三sal门下");
 
         expect_equal(
             result,
-            {"门下"},
-            "Non-CJK boundary separation"
+            {"sal", "门下"},
+            "Mixed Chinese and English boundary"
+        );
+    }
+
+    // 测试 6：全角中文标点与半角标点符号隔离
+    {
+        auto result = tokenizer.cut("三门峡，大天鹅！“好景” (test)");
+
+        expect_equal(
+            result,
+            {"三门", "门峡", "大天", "天鹅", "好景", "test"},
+            "Fullwidth and ASCII punctuation separation"
+        );
+    }
+
+    // 测试 7：英文、数字、下划线与代码标识符切分
+    {
+        auto result = tokenizer.cut("使用x86 AVX2和_mm256_fmadd_ps指令集，耗时2.88ms!");
+
+        expect_equal(
+            result,
+            {"使用", "x86", "AVX2", "mm256", "fmadd", "ps", "指令", "令集", "耗时", "2", "88ms"},
+            "Alphanumeric and code symbol tokenization"
+        );
+    }
+
+    // 测试 8：纯英文与数字标点分隔
+    {
+        auto result = tokenizer.cut("std::aligned_alloc(32, 1024);");
+
+        expect_equal(
+            result,
+            {"std", "aligned", "alloc", "32", "1024"},
+            "Pure English and numbers with punctuation"
         );
     }
 
