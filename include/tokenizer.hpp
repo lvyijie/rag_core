@@ -108,7 +108,7 @@ public:
     };
 
     // 流式范围接口：支持 for (auto token : tokenizer.cut(text))
-    Range cut(std::string_view text) const noexcept {
+    [[nodiscard]] static Range cut(std::string_view text) noexcept {
         return Range{text};
     }
 };
