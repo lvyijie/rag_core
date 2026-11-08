@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <istream>
+#include <memory>
 #include <mutex>
 #include <ostream>
 #include <string_view>
@@ -32,7 +33,8 @@ struct SearchHit {
 
 class InvertedIndex {
 public:
-    InvertedIndex() {
+    InvertedIndex()
+        : ws_pool_(std::make_unique<PoolSlot[]>(kWorkspacePoolSize)) {
         index_.reserve(16384);
         scratch_terms_.reserve(512);
     }
@@ -53,7 +55,8 @@ public:
           doc_norm_tf1_(std::move(other.doc_norm_tf1_)),
           cached_k1_(other.cached_k1_),
           cached_b_(other.cached_b_),
-          norms_dirty_(other.norms_dirty_.load(std::memory_order_relaxed)) {}
+          norms_dirty_(other.norms_dirty_.load(std::memory_order_relaxed)),
+          ws_pool_(std::move(other.ws_pool_)) {}
 
     InvertedIndex& operator=(InvertedIndex&& other) noexcept {
         if (this != &other) {
@@ -70,6 +73,7 @@ public:
             cached_k1_ = other.cached_k1_;
             cached_b_ = other.cached_b_;
             norms_dirty_.store(other.norms_dirty_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ws_pool_ = std::move(other.ws_pool_);
         }
         return *this;
     }
@@ -104,7 +108,6 @@ public:
 
     // 索引一篇新文档 (text 为原始内容，doc_id 为内部槽位号或文档唯一标号)
     void add_document(std::uint32_t doc_id, std::string_view text) {
-        // 若同一 doc_id 已存在且未删除，先清理其旧倒排项以保证幂等更新
         if (doc_id < doc_present_.size() && doc_present_[doc_id]) {
             if (!doc_deleted_[doc_id]) {
                 if (total_tokens_ >= doc_lengths_[doc_id]) {
@@ -123,7 +126,7 @@ public:
             doc_deleted_[doc_id] = 0;
         }
 
-        // 1. 使用复用缓冲区 + 排序归并统计本地词频 (消除每篇文档的 unordered_map 堆分配)
+        // 1. 使用复用缓冲区 + 排序归并统计本地词频
         scratch_terms_.clear();
         for (std::string_view token : Tokenizer::cut(text)) {
             scratch_terms_.push_back(fnv1a_hash(token));
@@ -176,22 +179,23 @@ public:
             return;
         }
 
-        // 线程局部查询工作区：多线程并发调用 search 时无锁且零数据竞争，单线程复用时零堆分配
-        thread_local ThreadWorkspace tls;
+        // 从无锁对象池租借工作区（避免 Windows MinGW thread_local 析构器堆损坏 Bug）
+        ScopedWorkspace guard(ws_pool_.get());
+        auto& ws = guard.ws;
 
         // 1. 提取并去重 Query 的词项
-        tls.query_terms.clear();
+        ws.query_terms.clear();
         for (std::string_view token : Tokenizer::cut(query)) {
-            tls.query_terms.push_back(fnv1a_hash(token));
+            ws.query_terms.push_back(fnv1a_hash(token));
         }
-        if (tls.query_terms.empty()) {
+        if (ws.query_terms.empty()) {
             return;
         }
-        std::sort(tls.query_terms.begin(), tls.query_terms.end());
-        tls.query_terms.erase(std::unique(tls.query_terms.begin(), tls.query_terms.end()),
-                              tls.query_terms.end());
+        std::sort(ws.query_terms.begin(), ws.query_terms.end());
+        ws.query_terms.erase(std::unique(ws.query_terms.begin(), ws.query_terms.end()),
+                             ws.query_terms.end());
 
-        // 2. 双重检查锁定惰性更新 BM25 长度归一化表（热路径仅单次原子读取，无锁开销）
+        // 2. 双重检查锁定惰性更新 BM25 长度归一化表
         if (norms_dirty_.load(std::memory_order_acquire) || cached_k1_ != k1 || cached_b_ != b) {
             std::lock_guard<std::mutex> lock(norm_mutex_);
             if (norms_dirty_.load(std::memory_order_relaxed) || cached_k1_ != k1 || cached_b_ != b) {
@@ -200,19 +204,19 @@ public:
         }
 
         const std::size_t max_slot = doc_lengths_.size();
-        if (tls.score_buf.size() < max_slot) {
-            tls.score_buf.resize(max_slot, -1.0f);
+        if (ws.score_buf.size() < max_slot) {
+            ws.score_buf.resize(max_slot, -1.0f);
         }
 
-        // 3. 使用线程局部扁平数组 score_buf + touched_docs 累加 BM25 分数
-        tls.touched_docs.clear();
+        // 3. 使用扁平数组 score_buf + touched_docs 累加 BM25 分数
+        ws.touched_docs.clear();
         const float* __restrict doc_k = doc_k_.data();
         const float* __restrict norm_tf1 = doc_norm_tf1_.data();
         const std::uint8_t* __restrict deleted = doc_deleted_.data();
         const bool check_del = has_deletions_;
-        float* __restrict scores = tls.score_buf.data();
+        float* __restrict scores = ws.score_buf.data();
 
-        for (std::uint32_t term_id : tls.query_terms) {
+        for (std::uint32_t term_id : ws.query_terms) {
             auto it = index_.find(term_id);
             if (it == index_.end()) {
                 continue;
@@ -224,7 +228,6 @@ public:
                 continue;
             }
 
-            // 计算 IDF (Lucene 平滑公式)
             const std::size_t eff_df = std::min(df, total_docs_);
             float idf = std::log(1.0f + (static_cast<float>(total_docs_ - eff_df) + 0.5f) /
                                            (static_cast<float>(eff_df) + 0.5f));
@@ -251,7 +254,7 @@ public:
 
                     float cur = scores[doc_id];
                     if (cur < 0.0f) {
-                        tls.touched_docs.push_back(doc_id);
+                        ws.touched_docs.push_back(doc_id);
                         cur = 0.0f;
                     }
                     scores[doc_id] = cur + delta;
@@ -274,7 +277,7 @@ public:
 
                     float cur = scores[doc_id];
                     if (cur < 0.0f) {
-                        tls.touched_docs.push_back(doc_id);
+                        ws.touched_docs.push_back(doc_id);
                         cur = 0.0f;
                     }
                     scores[doc_id] = cur + delta;
@@ -286,10 +289,10 @@ public:
         auto cmp = [](const SearchHit& a, const SearchHit& b) noexcept {
             return (a.score != b.score) ? (a.score > b.score) : (a.doc_id < b.doc_id);
         };
-        results.reserve(std::min(tls.touched_docs.size(), top_k));
+        results.reserve(std::min(ws.touched_docs.size(), top_k));
         float min_top_score = -1e30f;
 
-        for (std::uint32_t doc_id : tls.touched_docs) {
+        for (std::uint32_t doc_id : ws.touched_docs) {
             const float s = scores[doc_id];
             scores[doc_id] = -1.0f;
 
@@ -322,7 +325,6 @@ public:
         return results;
     }
 
-    // 序列化倒排索引至输出流
     bool save(std::ostream& os) const {
         const std::uint64_t slots = doc_lengths_.size();
         const std::uint64_t docs = total_docs_;
@@ -353,7 +355,6 @@ public:
         return static_cast<bool>(os);
     }
 
-    // 从输入流极速反序列化倒排索引（免分词直接挂载）
     bool load(std::istream& is) {
         std::uint64_t slots = 0;
         std::uint64_t docs = 0;
@@ -418,6 +419,8 @@ public:
     [[nodiscard]] std::size_t vocab_size() const noexcept { return index_.size(); }
 
 private:
+    static constexpr std::size_t kWorkspacePoolSize = 32;
+
     struct ThreadWorkspace {
         std::vector<std::uint32_t> query_terms;
         std::vector<float> score_buf;
@@ -426,6 +429,40 @@ private:
         ThreadWorkspace() {
             query_terms.reserve(64);
             touched_docs.reserve(2048);
+        }
+    };
+
+    struct PoolSlot {
+        std::atomic<bool> in_use{false};
+        ThreadWorkspace ws;
+    };
+
+    struct ScopedWorkspace {
+        PoolSlot* slot{nullptr};
+        std::unique_ptr<ThreadWorkspace> fallback;
+        ThreadWorkspace& ws;
+
+        explicit ScopedWorkspace(PoolSlot* pool) : ws(acquire(pool)) {}
+        ~ScopedWorkspace() noexcept {
+            if (slot) {
+                slot->in_use.store(false, std::memory_order_release);
+            }
+        }
+
+        ScopedWorkspace(const ScopedWorkspace&) = delete;
+        ScopedWorkspace& operator=(const ScopedWorkspace&) = delete;
+
+    private:
+        ThreadWorkspace& acquire(PoolSlot* pool) {
+            for (std::size_t i = 0; i < kWorkspacePoolSize; ++i) {
+                if (!pool[i].in_use.load(std::memory_order_relaxed) &&
+                    !pool[i].in_use.exchange(true, std::memory_order_acquire)) {
+                    slot = &pool[i];
+                    return slot->ws;
+                }
+            }
+            fallback = std::make_unique<ThreadWorkspace>();
+            return *fallback;
         }
     };
 
@@ -467,6 +504,7 @@ private:
     mutable float cached_k1_{1.2f};
     mutable float cached_b_{0.75f};
     mutable std::atomic<bool> norms_dirty_{true};
+    mutable std::unique_ptr<PoolSlot[]> ws_pool_;
 };
 
 } // namespace vrag

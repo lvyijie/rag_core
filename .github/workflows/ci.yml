@@ -19,16 +19,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake (Ubuntu)
+      - name: Configure and Build (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 4
+          ctest --test-dir build --output-on-failure -C Release
 
-      - name: Configure CMake (Windows MinGW)
+      - name: Configure and Build (Windows MinGW-w64)
         if: matrix.os == 'windows-latest'
-        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build targets
-        run: cmake --build build --config Release -j 4
-
-      - name: Run unit tests
-        run: ctest --test-dir build --output-on-failure -C Release
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\mingw64\bin;$env:PATH"
+          cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="C:/mingw64/bin/g++.exe"
+          cmake --build build --config Release -j 4
+          ctest --test-dir build --output-on-failure -C Release

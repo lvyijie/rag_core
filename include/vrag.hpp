@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <queue>
 #include <span>
 #include <string>
@@ -40,7 +42,8 @@ public:
                         std::size_t arena_capacity = 256ULL * 1024 * 1024)
         : dimension_(dimension),
           padded_dim_((dimension + 63) & ~std::size_t(63)),
-          arena_(arena_capacity) {}
+          arena_(arena_capacity),
+          ws_pool_(std::make_unique<PoolSlot[]>(kWorkspacePoolSize)) {}
 
     // 从原始语料二进制包 (*.bin: UTF-8 文本 + FP32 向量) 加载并构建索引
     bool load_from_binary(const std::string& filepath) {
@@ -61,7 +64,6 @@ public:
             return false;
         }
 
-        // 预分配容器与 Arena 容量，避免加载期动态扩容拷贝
         const std::size_t target_slots = slot_to_doc_id_.size() + doc_count;
         arena_.reserve(target_slots * padded_dim_);
         slot_to_doc_id_.reserve(target_slots);
@@ -209,7 +211,6 @@ public:
             return false;
         }
 
-        // 若同一外部 doc_id 已存在，先将其旧内部槽位软删除
         auto existing = doc_id_to_slot_.find(doc_id);
         if (existing != doc_id_to_slot_.end()) {
             const std::uint32_t old_slot = existing->second;
@@ -225,7 +226,6 @@ public:
 
         const std::uint32_t slot_id = static_cast<std::uint32_t>(slot_to_doc_id_.size());
 
-        // 1. 从 Arena 分配 32 字节对齐、64 字节倍数补齐的连续 int8 向量空间（容量不足时自动 2 倍扩容）
         int8_t* ptr = arena_.allocate<int8_t>(padded_dim_, 32);
         if (!ptr) {
             return false;
@@ -235,11 +235,9 @@ public:
         }
         std::span<int8_t> int8_span(ptr, dimension_);
 
-        // 2. 融合单遍归一化、量化与偏移和预计算
         int32_t sum_128 = 0;
         float scale = SimdInt8::normalize_and_quantize(raw_vector, int8_span, nullptr, nullptr, &sum_128);
 
-        // 3. 记录内部连续槽位元数据
         slot_to_doc_id_.push_back(doc_id);
         slot_deleted_.push_back(0);
         active_scales_.push_back(scale);
@@ -275,7 +273,7 @@ public:
         return doc_id_to_slot_.find(doc_id) != doc_id_to_slot_.end();
     }
 
-    // 线程安全只读双路混合检索 + RRF 融合（多线程并发调用零锁竞争，单线程复用零堆分配）
+    // 线程安全只读双路混合检索 + RRF 融合（基于无锁工作区池，多线程并发零锁竞争、单线程零堆分配）
     std::vector<HitResult> search(std::string_view query_text,
                                   std::span<const float> query_vector,
                                   std::size_t top_k = 5,
@@ -286,8 +284,8 @@ public:
 
         const std::size_t total_slots = slot_to_doc_id_.size();
 
-        // 线程局部查询工作区：保证任意多业务线程并发调用 engine.search() 绝对安全
-        thread_local SearchWorkspace ws;
+        ScopedWorkspace guard(ws_pool_.get());
+        auto& ws = guard.ws;
         ws.ensure_dimension(padded_dim_, total_slots);
 
         // 1. 右路：BM25 零分配全量召回（返回内部 slot_id）
@@ -379,10 +377,11 @@ public:
                     local_heap.reserve(top_dense);
                     float local_min = -1e30f;
 
+                    const auto slots_signed = static_cast<std::ptrdiff_t>(total_slots);
                     if (!check_del) {
                         #pragma omp for schedule(dynamic, 1024) nowait
-                        for (std::size_t i = 0; i < total_slots; ++i) {
-                            const int8_t* vec_ptr = arena_base + i * p_dim;
+                        for (std::ptrdiff_t i = 0; i < slots_signed; ++i) {
+                            const int8_t* vec_ptr = arena_base + static_cast<std::size_t>(i) * p_dim;
                             prefetch_l1(vec_ptr + p_dim * 2);
 
                             float sim = SimdInt8::dot_product_u8_s8_fast(
@@ -404,11 +403,11 @@ public:
                         }
                     } else {
                         #pragma omp for schedule(dynamic, 1024) nowait
-                        for (std::size_t i = 0; i < total_slots; ++i) {
+                        for (std::ptrdiff_t i = 0; i < slots_signed; ++i) {
                             if (deleted[i]) {
                                 continue;
                             }
-                            const int8_t* vec_ptr = arena_base + i * p_dim;
+                            const int8_t* vec_ptr = arena_base + static_cast<std::size_t>(i) * p_dim;
                             prefetch_l1(vec_ptr + p_dim * 2);
 
                             float sim = SimdInt8::dot_product_u8_s8_fast(
@@ -431,7 +430,7 @@ public:
                     }
                 }
 
-                for (const auto& local_heap : ws.thread_heaps) {
+                for (const auto& local_heap : shared_heaps) {
                     for (const auto& hit : local_heap) {
                         if (ws.dense_candidates.size() < top_dense) {
                             ws.dense_candidates.push_back(hit);
@@ -508,6 +507,8 @@ public:
     [[nodiscard]] std::size_t memory_used() const noexcept { return arena_.used_bytes(); }
 
 private:
+    static constexpr std::size_t kWorkspacePoolSize = 32;
+
     struct SearchWorkspace {
         std::vector<int8_t> q_int8;
         std::vector<uint8_t> q_abs;
@@ -538,6 +539,40 @@ private:
         }
     };
 
+    struct PoolSlot {
+        std::atomic<bool> in_use{false};
+        SearchWorkspace ws;
+    };
+
+    struct ScopedWorkspace {
+        PoolSlot* slot{nullptr};
+        std::unique_ptr<SearchWorkspace> fallback;
+        SearchWorkspace& ws;
+
+        explicit ScopedWorkspace(PoolSlot* pool) : ws(acquire(pool)) {}
+        ~ScopedWorkspace() noexcept {
+            if (slot) {
+                slot->in_use.store(false, std::memory_order_release);
+            }
+        }
+
+        ScopedWorkspace(const ScopedWorkspace&) = delete;
+        ScopedWorkspace& operator=(const ScopedWorkspace&) = delete;
+
+    private:
+        SearchWorkspace& acquire(PoolSlot* pool) {
+            for (std::size_t i = 0; i < kWorkspacePoolSize; ++i) {
+                if (!pool[i].in_use.load(std::memory_order_relaxed) &&
+                    !pool[i].in_use.exchange(true, std::memory_order_acquire)) {
+                    slot = &pool[i];
+                    return slot->ws;
+                }
+            }
+            fallback = std::make_unique<SearchWorkspace>();
+            return *fallback;
+        }
+    };
+
     static void prefetch_l1(const void* addr) noexcept {
 #if defined(__AVX2__) || defined(__SSE__)
         _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0);
@@ -561,6 +596,7 @@ private:
     std::unordered_map<std::uint32_t, std::uint32_t> doc_id_to_slot_;
     std::size_t active_docs_{0};
     bool has_deletions_{false};
+    mutable std::unique_ptr<PoolSlot[]> ws_pool_;
 };
 
 } // namespace vrag
