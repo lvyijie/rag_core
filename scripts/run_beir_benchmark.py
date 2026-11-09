@@ -156,18 +156,27 @@ def prepare_beir_bins(dataset: str, data_root: Path, mode: str) -> tuple[Path, P
             if qid_str in qrels_map:
                 test_queries.append((len(test_queries), obj.get("text", "").strip(), qrels_map[qid_str]))
 
-    dim = DIMENSION if mode in ("hybrid", "hybrid-sim") else 64
     corpus_bin = ds_dir / f"corpus_{mode}.bin"
     queries_bin = ds_dir / f"queries_{mode}.bin"
 
     if corpus_bin.exists() and queries_bin.exists():
         return corpus_bin, queries_bin
 
-    if mode == "hybrid":
+    if mode == "local-embed":
+        from fastembed import TextEmbedding
+        local_model_name = os.environ.get("LOCAL_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+        print(f"[*] Loading local ONNX embedding model '{local_model_name}' via FastEmbed...")
+        model = TextEmbedding(model_name=local_model_name)
+        doc_vecs = [v.tolist() for v in model.embed(corpus_texts, batch_size=64)]
+        q_vecs = [v.tolist() for v in model.embed([q[1] for q in test_queries], batch_size=64)]
+        dim = len(doc_vecs[0])
+    elif mode == "hybrid":
+        dim = DIMENSION
         print(f"[*] Embedding {len(corpus_texts)} corpus docs & {len(test_queries)} queries with {MODEL_NAME}...")
         doc_vecs = embed_all(corpus_texts)
         q_vecs = embed_all([q[1] for q in test_queries])
     elif mode == "hybrid-sim":
+        dim = DIMENSION
         import math, random
         rng = random.Random(42)
         pool_size = 256
@@ -177,6 +186,7 @@ def prepare_beir_bins(dataset: str, data_root: Path, mode: str) -> tuple[Path, P
             norm = math.sqrt(sum(x * x for x in v)) or 1.0
             vec_pool.append(struct.pack(f"<{dim}f", *[x / norm for x in v]))
     else:
+        dim = 64
         zero_bytes = struct.pack(f"<{dim}f", *([0.0] * dim))
 
     print(f"[*] Packing {corpus_bin.name} ({len(corpus_texts)} docs, dim={dim})...")
@@ -186,7 +196,7 @@ def prepare_beir_bins(dataset: str, data_root: Path, mode: str) -> tuple[Path, P
             tb = text.encode("utf-8")
             f.write(struct.pack("<II", doc_id, len(tb)))
             f.write(tb)
-            if mode == "hybrid":
+            if mode in ("hybrid", "local-embed"):
                 f.write(struct.pack(f"<{dim}f", *doc_vecs[doc_id]))
             elif mode == "hybrid-sim":
                 f.write(vec_pool[doc_id & (pool_size - 1)])
@@ -200,7 +210,7 @@ def prepare_beir_bins(dataset: str, data_root: Path, mode: str) -> tuple[Path, P
             tb = qtext.encode("utf-8")
             f.write(struct.pack("<II", qid, len(tb)))
             f.write(tb)
-            if mode == "hybrid":
+            if mode in ("hybrid", "local-embed"):
                 f.write(struct.pack(f"<{dim}f", *q_vecs[idx]))
             elif mode == "hybrid-sim":
                 f.write(vec_pool[idx & (pool_size - 1)])
@@ -217,7 +227,9 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     args = sys.argv[1:]
-    if "--hybrid-sim" in args:
+    if "--local-embed" in args:
+        mode = "local-embed"
+    elif "--hybrid-sim" in args:
         mode = "hybrid-sim"
     elif "--bm25" in args or not API_KEY:
         mode = "bm25"
@@ -237,10 +249,12 @@ def main():
         print(f"[-] Benchmark binary not found at {bench_exe}. Please build the project first.")
         sys.exit(1)
 
+    local_model_name = os.environ.get("LOCAL_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
     mode_desc = {
         "bm25": "Pure BM25",
-        "hybrid": f"Hybrid BM25+SQ8 ({MODEL_NAME})",
-        "hybrid-sim": "Full Hybrid BM25 + 1024d SQ8 Scan + RRF",
+        "local-embed": f"Real Embeddings ({local_model_name})",
+        "hybrid": f"Real Embeddings ({MODEL_NAME})",
+        "hybrid-sim": "Synthetic 1024d Vectors (Pipeline Latency Test)",
     }[mode]
 
     for ds in datasets:

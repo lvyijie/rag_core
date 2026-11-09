@@ -22,6 +22,19 @@ struct BeirQuery {
     std::unordered_map<std::uint32_t, std::uint32_t> qrels; // doc_id -> relevance grade (>0)
 };
 
+struct EvalSummary {
+    std::string mode_name;
+    double ndcg_10{0.0};
+    double mrr_10{0.0};
+    double recall_10{0.0};
+    double recall_100{0.0};
+    double avg_ms{0.0};
+    double p50_ms{0.0};
+    double p95_ms{0.0};
+    double p99_ms{0.0};
+    double qps{0.0};
+};
+
 static bool load_beir_queries(const std::string& path, std::size_t expected_dim, std::vector<BeirQuery>& out) {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs.is_open()) {
@@ -80,56 +93,23 @@ static bool load_beir_queries(const std::string& path, std::size_t expected_dim,
     return true;
 }
 
-int main(int argc, char* argv[]) {
-#if defined(_WIN32)
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-#endif
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <corpus.bin> <queries.bin> [dataset_name]\n";
-        return 1;
-    }
-
-    const std::string corpus_path = argv[1];
-    const std::string queries_path = argv[2];
-    const std::string dataset_name = (argc >= 4) ? argv[3] : "BEIR";
-
-    // 读取 corpus.bin 头获取维度
-    std::uint32_t doc_count = 0;
-    std::uint32_t dim = 0;
-    {
-        std::ifstream ifs(corpus_path, std::ios::binary);
-        if (!ifs.is_open()) {
-            std::cerr << "Cannot open corpus file: " << corpus_path << "\n";
-            return 1;
-        }
-        ifs.read(reinterpret_cast<char*>(&doc_count), sizeof(doc_count));
-        ifs.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-    }
-
-    vrag::VragEngine engine(dim, 64ULL * 1024 * 1024);
-
-    auto t_load_start = std::chrono::high_resolution_clock::now();
-    if (!engine.load_from_binary(corpus_path)) {
-        return 1;
-    }
-    auto t_load_end = std::chrono::high_resolution_clock::now();
-    double load_ms = std::chrono::duration<double, std::milli>(t_load_end - t_load_start).count();
-
-    std::vector<BeirQuery> queries;
-    if (!load_beir_queries(queries_path, dim, queries) || queries.empty()) {
-        std::cerr << "Failed to load queries from " << queries_path << "\n";
-        return 1;
-    }
-
-    // 预热 20 次
+static EvalSummary evaluate_mode(
+    const vrag::VragEngine& engine,
+    const std::vector<BeirQuery>& queries,
+    const std::string& mode_name,
+    bool use_sparse,
+    bool use_dense,
+    float rrf_k = 60.0f
+) {
+    const std::vector<float> empty_vec;
     const std::size_t warmup = std::min<std::size_t>(20, queries.size());
     for (std::size_t i = 0; i < warmup; ++i) {
-        auto res = engine.search(queries[i].text, queries[i].vector, 10);
+        std::string_view qt = use_sparse ? std::string_view(queries[i].text) : std::string_view{};
+        std::span<const float> qv = use_dense ? std::span<const float>(queries[i].vector) : std::span<const float>(empty_vec);
+        auto res = engine.search(qt, qv, 10, rrf_k);
         (void)res;
     }
 
-    // 正式评测 (检索 Top-100 以同时计算 NDCG@10, MRR@10, Recall@10, Recall@100, 以及 Top-10 延迟)
     std::vector<double> latencies_top10_ms;
     latencies_top10_ms.reserve(queries.size());
 
@@ -139,14 +119,16 @@ int main(int argc, char* argv[]) {
     double sum_recall_100 = 0.0;
 
     for (const auto& q : queries) {
+        std::string_view qt = use_sparse ? std::string_view(q.text) : std::string_view{};
+        std::span<const float> qv = use_dense ? std::span<const float>(q.vector) : std::span<const float>(empty_vec);
+
         auto t0 = std::chrono::high_resolution_clock::now();
-        auto hits_10 = engine.search(q.text, q.vector, 10);
+        auto hits_10 = engine.search(qt, qv, 10, rrf_k);
         auto t1 = std::chrono::high_resolution_clock::now();
         latencies_top10_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
 
-        auto hits_100 = engine.search(q.text, q.vector, 100);
+        auto hits_100 = engine.search(qt, qv, 100, rrf_k);
 
-        // 1. 计算 DCG@10 与 IDCG@10 (标准 TREC / BEIR 公式: (2^rel - 1) / log2(rank + 1))
         double dcg_10 = 0.0;
         double mrr_10 = 0.0;
         std::size_t rel_found_10 = 0;
@@ -200,37 +182,102 @@ int main(int argc, char* argv[]) {
 
     std::sort(latencies_top10_ms.begin(), latencies_top10_ms.end());
     const std::size_t nq = queries.size();
-    const double avg_ms = std::accumulate(latencies_top10_ms.begin(), latencies_top10_ms.end(), 0.0) /
-                          static_cast<double>(nq);
-    const double p50_ms = latencies_top10_ms[nq * 50 / 100];
-    const double p95_ms = latencies_top10_ms[nq * 95 / 100];
-    const double p99_ms = latencies_top10_ms[std::min(nq - 1, nq * 99 / 100)];
-    const double qps = (avg_ms > 0.0) ? (1000.0 / avg_ms) : 0.0;
+    EvalSummary s;
+    s.mode_name = mode_name;
+    s.ndcg_10 = sum_ndcg_10 / static_cast<double>(nq);
+    s.mrr_10 = sum_mrr_10 / static_cast<double>(nq);
+    s.recall_10 = sum_recall_10 / static_cast<double>(nq);
+    s.recall_100 = sum_recall_100 / static_cast<double>(nq);
+    s.avg_ms = std::accumulate(latencies_top10_ms.begin(), latencies_top10_ms.end(), 0.0) / static_cast<double>(nq);
+    s.p50_ms = latencies_top10_ms[nq * 50 / 100];
+    s.p95_ms = latencies_top10_ms[nq * 95 / 100];
+    s.p99_ms = latencies_top10_ms[std::min(nq - 1, nq * 99 / 100)];
+    s.qps = (s.avg_ms > 0.0) ? (1000.0 / s.avg_ms) : 0.0;
+    return s;
+}
 
-    std::cout << std::fixed << std::setprecision(4);
-    std::cout << "========================================================\n";
-    std::cout << " Standard BEIR Benchmark Report: " << dataset_name << "\n";
-    std::cout << "========================================================\n";
-    std::cout << " Corpus Size      : " << engine.document_count() << " docs\n";
-    std::cout << " Test Queries     : " << nq << " queries (with ground-truth qrels)\n";
-    std::cout << " Index Build Time : " << std::setprecision(2) << load_ms << " ms ("
-              << (engine.document_count() * 1000.0 / load_ms) << " docs/s)\n";
-    std::cout << "--------------------------------------------------------\n";
-    std::cout << std::setprecision(4);
-    std::cout << " [Accuracy Metrics]\n";
-    std::cout << "   NDCG@10        : " << (sum_ndcg_10 / nq) << "\n";
-    std::cout << "   MRR@10         : " << (sum_mrr_10 / nq) << "\n";
-    std::cout << "   Recall@10      : " << (sum_recall_10 / nq) << "\n";
-    std::cout << "   Recall@100     : " << (sum_recall_100 / nq) << "\n";
-    std::cout << "--------------------------------------------------------\n";
-    std::cout << std::setprecision(3);
-    std::cout << " [Latency & Throughput (Top-10)]\n";
-    std::cout << "   Avg Latency    : " << avg_ms << " ms\n";
-    std::cout << "   P50 Latency    : " << p50_ms << " ms\n";
-    std::cout << "   P95 Latency    : " << p95_ms << " ms\n";
-    std::cout << "   P99 Latency    : " << p99_ms << " ms\n";
-    std::cout << "   Throughput     : " << std::setprecision(1) << qps << " QPS\n";
-    std::cout << "========================================================\n";
+int main(int argc, char* argv[]) {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <corpus.bin> <queries.bin> [dataset_name]\n";
+        return 1;
+    }
+
+    const std::string corpus_path = argv[1];
+    const std::string queries_path = argv[2];
+    const std::string dataset_name = (argc >= 4) ? argv[3] : "BEIR";
+
+    std::uint32_t doc_count = 0;
+    std::uint32_t dim = 0;
+    {
+        std::ifstream ifs(corpus_path, std::ios::binary);
+        if (!ifs.is_open()) {
+            std::cerr << "Cannot open corpus file: " << corpus_path << "\n";
+            return 1;
+        }
+        ifs.read(reinterpret_cast<char*>(&doc_count), sizeof(doc_count));
+        ifs.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+    }
+
+    vrag::VragEngine engine(dim, 64ULL * 1024 * 1024);
+
+    auto t_load_start = std::chrono::high_resolution_clock::now();
+    if (!engine.load_from_binary(corpus_path)) {
+        return 1;
+    }
+    auto t_load_end = std::chrono::high_resolution_clock::now();
+    double load_ms = std::chrono::duration<double, std::milli>(t_load_end - t_load_start).count();
+
+    std::vector<BeirQuery> queries;
+    if (!load_beir_queries(queries_path, dim, queries) || queries.empty()) {
+        std::cerr << "Failed to load queries from " << queries_path << "\n";
+        return 1;
+    }
+
+    bool has_dense_vectors = false;
+    for (float v : queries[0].vector) {
+        if (v != 0.0f) {
+            has_dense_vectors = true;
+            break;
+        }
+    }
+
+    std::cout << "====================================================================================================\n";
+    std::cout << " Standard BEIR Benchmark & Ablation Report: " << dataset_name << "\n";
+    std::cout << " Corpus: " << engine.document_count() << " docs (dim=" << dim << ") | Test Queries: " << queries.size()
+              << " | Index Build: " << std::fixed << std::setprecision(2) << load_ms << " ms\n";
+    std::cout << "====================================================================================================\n";
+    std::cout << std::left << std::setw(28) << "Retrieval Mode"
+              << " | " << std::right << std::setw(8) << "NDCG@10"
+              << " | " << std::setw(8) << "MRR@10"
+              << " | " << std::setw(9) << "Recall@10"
+              << " | " << std::setw(10) << "Recall@100"
+              << " | " << std::setw(22) << "Latency Avg/P50/P99"
+              << " | " << std::setw(10) << "QPS\n";
+    std::cout << "----------------------------------------------------------------------------------------------------\n";
+
+    std::vector<EvalSummary> summaries;
+    summaries.push_back(evaluate_mode(engine, queries, "1. BM25 Only (Sparse)", true, false));
+    if (has_dense_vectors) {
+        summaries.push_back(evaluate_mode(engine, queries, "2. Dense SQ8 Only (Vector)", false, true));
+        summaries.push_back(evaluate_mode(engine, queries, "3. Hybrid (BM25+SQ8+RRF)", true, true));
+    }
+
+    for (const auto& s : summaries) {
+        std::ostringstream lat_ss;
+        lat_ss << std::fixed << std::setprecision(3) << s.avg_ms << "/" << s.p50_ms << "/" << s.p99_ms << " ms";
+        std::cout << std::left << std::setw(28) << s.mode_name
+                  << " | " << std::right << std::fixed << std::setprecision(4) << std::setw(8) << s.ndcg_10
+                  << " | " << std::setw(8) << s.mrr_10
+                  << " | " << std::setw(9) << s.recall_10
+                  << " | " << std::setw(10) << s.recall_100
+                  << " | " << std::setw(22) << lat_ss.str()
+                  << " | " << std::setprecision(1) << std::setw(10) << s.qps << "\n";
+    }
+    std::cout << "====================================================================================================\n";
 
     return 0;
 }
