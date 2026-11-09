@@ -69,4 +69,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
 
     add_executable(bench_search src/bench_search.cpp)
     target_link_libraries(bench_search PRIVATE rag_core)
+
+    add_executable(beir_bench src/beir_bench.cpp)
+    target_link_libraries(beir_bench PRIVATE rag_core)
 endif()

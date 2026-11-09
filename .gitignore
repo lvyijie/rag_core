@@ -18,6 +18,7 @@ out/
 *.bin
 *.vidx
 test_txt/
+beir_data/
 
 # IDE & Editor files
 .vscode/

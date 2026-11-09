@@ -216,6 +216,18 @@ public:
         const bool check_del = has_deletions_;
         float* __restrict scores = ws.score_buf.data();
 
+        // 检查是否存在高区分度词项 (df <= 50% N)；若存在，则自动跳过 df > 50% N 的高频停用词倒排链
+        bool has_informative_term = false;
+        if (ws.query_terms.size() >= 3 && total_docs_ >= 32) {
+            for (std::uint32_t term_id : ws.query_terms) {
+                auto it = index_.find(term_id);
+                if (it != index_.end() && !it->second.empty() && it->second.size() * 2 <= total_docs_) {
+                    has_informative_term = true;
+                    break;
+                }
+            }
+        }
+
         for (std::uint32_t term_id : ws.query_terms) {
             auto it = index_.find(term_id);
             if (it == index_.end()) {
@@ -224,7 +236,7 @@ public:
 
             const auto& postings = it->second;
             const std::size_t df = postings.size();
-            if (df == 0) {
+            if (df == 0 || (has_informative_term && df * 2 > total_docs_)) {
                 continue;
             }
 
