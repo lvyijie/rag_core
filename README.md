@@ -1,22 +1,24 @@
 # vrag-core
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square&logo=cplusplus)
+![Python](https://img.shields.io/badge/Python-3.8%2B%20%7C%20NumPy-3776AB?style=flat-square&logo=python)
 ![SIMD](https://img.shields.io/badge/SIMD-AVX--VNNI%20%7C%20AVX2-0071C5?style=flat-square&logo=intel)
 ![OpenMP](https://img.shields.io/badge/Parallel-OpenMP-3FB950?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)
 
-> **说明**：本项目是一个**个人学习项目**，用于探索现代 C++20、SIMD 指令集优化（AVX2 / AVX-VNNI）、内存对齐管理以及本地 RAG 混合检索的底层实现。
+> **说明**：本项目是一个**个人学习与工程实践项目**，用于探索现代 C++20、SIMD 指令集优化（AVX2 / AVX-VNNI）、内存对齐管理以及面向本地 AI Agent 的嵌入式（In-Process）RAG 混合检索内核实现。
 
-**vrag-core** 是一个零外部依赖、纯头文件（Header-Only）的轻量级内存混合检索内核，将 **BM25 稀疏倒排检索** 与 **SQ8 标量量化稠密向量扫描** 结合，通过 **RRF（倒数排名融合）** 输出重排结果。
+**vrag-core (`rag_core`)** 是一个零外部 C++ 依赖、支持 C++ Header-Only / C ABI / Python SDK 的轻量级内存混合检索内核，将 **BM25 稀疏倒排检索** 与 **SQ8 标量量化稠密向量扫描** 结合，通过 **加权 RRF（Weighted Reciprocal Rank Fusion）** 输出融合排序结果。
 
 ---
 
 ## 核心特性
 
-- **双路混合检索**：结合 BM25 倒排索引与 INT8 量化向量扫描，利用 RRF 融合字面匹配与向量相似度（支持仅稀疏、仅稠密、双路融合三种模式）。
-- **零拷贝流式分词**：支持 CJK UTF-8 二元滑窗（Bi-gram）与大小写不敏感的 ASCII 字母数字（`[a-zA-Z0-9]+`）切分，不含词干还原（Stemmer）。
-- **SIMD 向量算子**：支持 `AVX-VNNI` (`vpdpbusd`) 与 `AVX2 + FMA` 点积计算，对称 INT8 量化减少 75% 向量内存占用，非 AVX2 环境提供标量回退。
-- **并发与持久化支持**：内置 64B 对齐自动扩容 `Arena` 内存池与无锁查询工作区池，支持多线程 `const` 查询、文档幂等更新（Upsert）、墓碑软删除及预量化索引文件存取（`save_index` / `load_index`）。
+- **三路检索与加权融合**：支持纯稀疏（`BM25`）、纯稠密（`Dense SQ8`）与加权混合检索（`Hybrid Weighted RRF`），同时返回双路原始得分（`bm25_score`、`dense_score`）与各自排名（`bm25_rank`、`dense_rank`），支持自定义元数据前置过滤（`Metadata Filter`）与重排钩子（`Reranker`）。
+- **零拷贝流式分词**：支持 CJK UTF-8 二元滑窗（Bi-gram）与大小写不敏感的 ASCII 字母数字（`[a-zA-Z0-9]+`）切分，内置非法/截断 UTF-8 延续字节防护，不含词干还原（Stemmer）。
+- **SIMD 向量算子**：支持 `AVX-VNNI` (`vpdpbusd`) 与 `AVX2 + FMA` 点积计算，对称 INT8 量化将向量池内存压缩 4.0 倍（BEIR Top-10 重合率 `> 97.2%`），非 AVX2 环境提供标量回退。
+- **读写并发与原子持久化**：内置 64B 对齐自动扩容 `Arena` 内存池、32 槽位无锁查询工作区池与 `std::shared_mutex` 读写锁（16 线程并发读取吞吐达 `66k ~ 107k QPS`）；支持幂等更新（Upsert）、墓碑删除、物理空间压缩（`compact()`）及带 64 位 FNV-1a 校验和的原子快照存取（`VRAGIDX3` 格式）。
+- **零拷贝 Python SDK (`rag_core`)**：通过稳定 C ABI 动态库（`rag_core_c`）提供开箱即用的 Python 绑定，支持 1D/2D `numpy.ndarray(dtype=np.float32)` 原始内存指针零拷贝直传与 GIL 自动释放。
 
 ---
 
@@ -26,28 +28,36 @@
 rag_core/
 ├── include/
 │   ├── arena.hpp           # 64B 对齐自动扩容线性内存池
-│   ├── inverted_index.hpp  # 内存倒排索引与 BM25 打分
+│   ├── inverted_index.hpp  # 内存倒排索引、BM25 打分与物理压缩
+│   ├── rag_core_c.h        # 稳定 C ABI 接口声明 (供 Python / 跨语言 FFI 调用)
 │   ├── simd_int8.hpp       # SQ8 量化与 AVX-VNNI / AVX2 点积算子
 │   ├── simd_vector.hpp     # FP32 AVX2 向量点积与 L2 归一化
 │   ├── tokenizer.hpp       # UTF-8 CJK Bi-gram 与 ASCII 字母数字分词器
-│   └── vrag.hpp            # 混合检索主引擎、CRUD 与 RRF 融合
-├── src/                    # CLI (cli_search)、压测 (bench_search) 与 BEIR 消融评测 (beir_bench)
-├── tests/                  # 单元测试与召回率测试
+│   └── vrag.hpp            # 混合检索主引擎、读写锁并发、VRAGIDX3 持久化与 W-RRF
+├── python/
+│   └── rag_core/           # Python SDK (Index, SearchOptions, SearchResult, 零拷贝 NumPy 桥接)
+├── examples/
+│   └── python_agent_rag_demo.py # 本地 AI Agent 混合检索、过滤重排与 Prompt 组装示例
+├── src/                    # C ABI 实现 (rag_core_c.cpp)、CLI、压测与 BEIR 消融评测
+├── tests/                  # C++ 单元测试 (P0~P3) 与 Python SDK 集成测试 (p5_python_test.py)
 ├── benchmarks/             # 分词、SIMD 与端到端微基准测试
-└── scripts/                # 语料构建与 BEIR 自动评测脚本
+├── scripts/                # 语料构建与 BEIR 自动评测脚本
+├── pyproject.toml          # Python 包配置
+└── ROADMAP.md              # 工程演进路线图与验收记录
 ```
 
 ---
 
 ## 快速开始
 
-### 1. 编译与测试
+### 1. 编译与测试 (C++ & Python)
 
 **Linux / macOS**
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
+python3 tests/p5_python_test.py
 ```
 
 **Windows (MinGW-w64)**
@@ -55,9 +65,50 @@ ctest --test-dir build --output-on-failure
 cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 8
 ctest --test-dir build --output-on-failure
+python tests/p5_python_test.py
 ```
 
-### 2. 代码调用示例
+> CMake 构建目标 `rag_core_c` 会自动生成动态库（`rag_core_c.dll` / `librag_core_c.so`）并同步至 `python/rag_core/`，随后可通过 `pip install -e .` 安装到当前 Python 环境。
+
+### 2. Python SDK 调用示例 (`rag_core`)
+
+完整可运行案例请参考 [`examples/python_agent_rag_demo.py`](file:///c:/Users/qq150/source/repos/rag_core/examples/python_agent_rag_demo.py)（含 2D NumPy 零拷贝批量入库、加权 RRF、元数据过滤、自定义 Reranker 钩子与 RAG Prompt 构建）：
+
+```python
+import numpy as np
+from rag_core import Index, SearchMode, SearchOptions
+
+# 1. 创建 384 维混合检索索引
+index = Index(dimension=384)
+
+# 2. 零拷贝批量入库 2D C-contiguous float32 NumPy 矩阵 (OpenMP 并行归一化与 SQ8 量化)
+doc_ids = [101, 102]
+texts = [
+    "SQ8 quantization compresses 384-D vectors by 4.0x with 97.3% Top-10 overlap.",
+    "VRAGIDX3 atomic persistence verifies a 64-bit FNV-1a checksum before loading.",
+]
+embeddings = np.random.randn(2, 384).astype(np.float32)
+metadatas = ["module=quantization;tier=core", "module=persistence;tier=storage"]
+index.add_documents(doc_ids, texts, embeddings, metadatas)
+
+# 3. 加权混合检索 (Weighted RRF) + 元数据前置过滤
+opts = SearchOptions(
+    top_k=5,
+    mode=SearchMode.HYBRID,
+    bm25_weight=0.3,
+    dense_weight=1.0,
+    filter=lambda doc_id, meta: "tier=core" in meta,
+)
+hits = index.search("SQ8 4.0x vector compression", embeddings[0], options=opts)
+for h in hits:
+    print(f"doc_id={h.doc_id} score={h.score:.4f} bm25={h.bm25_score:.2f}#{h.bm25_rank} "
+          f"cosine={h.dense_score:.4f}#{h.dense_rank} meta={h.metadata}")
+
+# 4. 原子保存与事务性加载快照
+index.save_index("agent_kb.vidx")
+```
+
+### 3. C++20 代码调用示例
 
 ```cpp
 #include "vrag.hpp"
@@ -93,7 +144,7 @@ int main() {
 }
 ```
 
-### 3. 运行 BEIR 基准与消融评测
+### 4. 运行 BEIR 基准与消融评测
 
 ```powershell
 # 1. 使用本地开源模型 (FastEmbed BAAI/bge-small-en-v1.5) 运行 BM25 vs Dense vs Hybrid 三路消融评测

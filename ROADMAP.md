@@ -88,14 +88,14 @@
 
 ---
 
-### P5：Python 绑定与生态集成（中优先级 | 待执行）
+### P5：Python 绑定与生态集成（中优先级 | ✅ 已完成）
 
 **目标**：让 Python 编写的本地 AI Agent / LangChain / LlamaIndex 脚本能够直接 `import rag_core` 调用 C++ 引擎。
 
-| 子任务 | 具体内容 | 验收标准 (Acceptance Criteria) |
+| 子任务 | 具体内容 | 验收状态与实测结果 (Acceptance Criteria & Results) |
 | :--- | :--- | :--- |
-| **P5.1 `nanobind` / `pybind11` 绑定** | 封装 `VragEngine`、`SearchOptions`、`SearchResult`，支持零拷贝接收 NumPy `float32` 向量 (`np.ndarray`) | Python 端传入 NumPy 数组无需逐元素拷贝，查询过程中释放 GIL 支持多线程 |
-| **P5.2 `pyproject.toml` 打包与 `pytest`** | 配置 `scikit-build-core` 一键 `pip install .`，编写 Python 端集成测试与对接本地 Embedding 模型（如 FastEmbed / Ollama）的示例 | `pytest` 全部通过，提供开箱即用的 Python RAG 示例脚本 |
+| **P5.1 稳定 C ABI 与零拷贝 Python SDK** | 提供跨编译器 ABI 兼容的 C 接口（[`include/rag_core_c.h`](file:///c:/Users/qq150/source/repos/rag_core/include/rag_core_c.h) / [`src/rag_core_c.cpp`](file:///c:/Users/qq150/source/repos/rag_core/src/rag_core_c.cpp)）与 Python SDK（[`python/rag_core/__init__.py`](file:///c:/Users/qq150/source/repos/rag_core/python/rag_core/__init__.py)），封装 `Index` (`VragEngine`)、`SearchMode`、`SearchOptions`、`SearchResult`、`MemoryStats` | ✅ 已完成：支持 1D/2D `np.ndarray(dtype=np.float32)` 原始内存指针零拷贝直传 C++ 引擎，C ABI 调用期间自动释放 Python GIL，支持 `ThreadPoolExecutor` 多线程并发查询 |
+| **P5.2 `pyproject.toml`、测试套件与 Agent 示例** | 提供 [`pyproject.toml`](file:///c:/Users/qq150/source/repos/rag_core/pyproject.toml)、Python 完整测试套件（[`tests/p5_python_test.py`](file:///c:/Users/qq150/source/repos/rag_core/tests/p5_python_test.py)）以及本地 AI Agent 混合检索示例（[`examples/python_agent_rag_demo.py`](file:///c:/Users/qq150/source/repos/rag_core/examples/python_agent_rag_demo.py)） | ✅ 已完成：覆盖单条/2D NumPy 批量入库、三路检索、Weighted RRF、Metadata Filter 回调、Python Reranker 钩子、`VRAGIDX3` 持久化、墓碑压缩与 8 线程并发检索，全部断言 100% 通过 |
 
 ---
 

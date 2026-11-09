@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-core"
+version = "1.0.0"
+description = "Lightweight In-Process C++20 Hybrid Retrieval Engine (BM25 + SQ8 Dense Vector + Weighted RRF)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+packages = ["rag_core"]
+
+[tool.setuptools.package-data]
+rag_core = ["*.dll", "*.so", "*.dylib"]

@@ -28,8 +28,10 @@ compile_commands.json
 *.swp
 .DS_Store
 
-# Python cache
+# Python cache & packaging
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
 .venv/
 venv/

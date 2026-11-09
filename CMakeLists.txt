@@ -25,6 +25,18 @@ target_include_directories(rag_core INTERFACE
 )
 target_link_libraries(rag_core INTERFACE OpenMP::OpenMP_CXX)
 
+# C ABI 动态共享库（供 Python ctypes / NumPy 零拷贝绑定及跨语言 FFI 调用）
+add_library(rag_core_c SHARED src/rag_core_c.cpp)
+target_link_libraries(rag_core_c PRIVATE rag_core)
+if(MINGW)
+    target_link_options(rag_core_c PRIVATE -static-libgcc -static-libstdc++)
+    set_target_properties(rag_core_c PROPERTIES PREFIX "")
+endif()
+add_custom_command(TARGET rag_core_c POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/python/rag_core"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rag_core_c>" "${CMAKE_CURRENT_SOURCE_DIR}/python/rag_core/"
+)
+
 # 仅在作为顶层项目构建时编译测试、Benchmark 与 CLI 工具
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     enable_testing()
