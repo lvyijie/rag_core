@@ -8,6 +8,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -235,7 +236,9 @@ static EvalSummary evaluate_mode(
     bool use_dense,
     float rrf_k = 60.0f,
     float bm25_weight = 1.0f,
-    float dense_weight = 1.0f
+    float dense_weight = 1.0f,
+    int num_threads = 1,
+    int timing_passes = 5
 ) {
     const std::vector<float> empty_vec;
     vrag::SearchOptions opts10;
@@ -245,6 +248,7 @@ static EvalSummary evaluate_mode(
     opts10.rrf_k = rrf_k;
     opts10.bm25_weight = bm25_weight;
     opts10.dense_weight = dense_weight;
+    opts10.num_threads = num_threads;
 
     vrag::SearchOptions opts100 = opts10;
     opts100.top_k = 100;
@@ -259,6 +263,7 @@ static EvalSummary evaluate_mode(
 
     std::vector<double> latencies_top10_ms;
     latencies_top10_ms.reserve(queries.size());
+    std::vector<double> pass_samples(static_cast<std::size_t>(std::max(1, timing_passes)));
 
     double sum_ndcg_10 = 0.0;
     double sum_mrr_10 = 0.0;
@@ -269,10 +274,15 @@ static EvalSummary evaluate_mode(
         std::string_view qt = use_sparse ? std::string_view(q.text) : std::string_view{};
         std::span<const float> qv = use_dense ? std::span<const float>(q.vector) : std::span<const float>(empty_vec);
 
-        auto t0 = std::chrono::high_resolution_clock::now();
-        auto hits_10 = engine.search(qt, qv, opts10);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        latencies_top10_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        std::vector<vrag::HitResult> hits_10;
+        for (int p = 0; p < std::max(1, timing_passes); ++p) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            hits_10 = engine.search(qt, qv, opts10);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            pass_samples[static_cast<std::size_t>(p)] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        std::sort(pass_samples.begin(), pass_samples.end());
+        latencies_top10_ms.push_back(pass_samples[pass_samples.size() / 2]);
 
         auto hits_100 = engine.search(qt, qv, opts100);
 
@@ -407,37 +417,50 @@ int main(int argc, char* argv[]) {
     std::cout << "----------------------------------------------------------------------------------------------------\n";
 
     std::vector<EvalSummary> summaries;
-    summaries.push_back(evaluate_mode(engine, queries, "1. BM25 Only (Sparse)", true, false));
+    const int omp_threads = omp_get_max_threads();
+    summaries.push_back(evaluate_mode(engine, queries, "1. BM25 Only (1-Thread)", true, false, 60.0f, 1.0f, 1.0f, 1, 5));
 
     Fp32ReferenceCorpus fp32_ref;
-    double top10_overlap_sum = 0.0;
+    std::vector<double> query_overlaps;
+    std::vector<double> cos_abs_errors;
 
     if (has_dense_vectors && fp32_ref.load(corpus_path)) {
-        // Evaluate FP32 Exact Dense & Hybrid
+        query_overlaps.reserve(queries.size());
+        cos_abs_errors.reserve(queries.size() * 10);
+
         auto eval_fp32_mode = [&](const std::string& mode_name, bool use_sparse) -> EvalSummary {
             std::vector<double> latencies;
             latencies.reserve(queries.size());
+            std::vector<double> pass_samples(3);
             double sum_ndcg_10 = 0.0, sum_mrr_10 = 0.0, sum_recall_10 = 0.0, sum_recall_100 = 0.0;
 
             for (const auto& q : queries) {
-                auto t0 = std::chrono::high_resolution_clock::now();
-                auto hits_10 = fp32_ref.search_fp32(q.text, q.vector, 10, use_sparse);
-                auto t1 = std::chrono::high_resolution_clock::now();
-                latencies.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+                std::vector<vrag::SearchHit> hits_10;
+                for (int p = 0; p < 3; ++p) {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    hits_10 = fp32_ref.search_fp32(q.text, q.vector, 10, use_sparse);
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    pass_samples[static_cast<std::size_t>(p)] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                }
+                std::sort(pass_samples.begin(), pass_samples.end());
+                latencies.push_back(pass_samples[1]);
 
                 auto hits_100 = fp32_ref.search_fp32(q.text, q.vector, 100, use_sparse);
 
                 if (!use_sparse) {
-                    // Measure Top-10 set overlap between FP32 Exact and SQ8
-                    auto sq8_10 = engine.search("", q.vector, 10);
-                    std::unordered_set<std::uint32_t> fp32_set;
-                    for (const auto& h : hits_10) fp32_set.insert(h.doc_id);
+                    auto sq8_10 = engine.search_dense(q.vector, 10);
+                    std::unordered_map<std::uint32_t, float> fp32_map;
+                    for (const auto& h : hits_10) fp32_map[h.doc_id] = h.score;
                     std::size_t matched = 0;
                     for (const auto& h : sq8_10) {
-                        if (fp32_set.count(h.doc_id)) ++matched;
+                        auto it = fp32_map.find(h.doc_id);
+                        if (it != fp32_map.end()) {
+                            ++matched;
+                            cos_abs_errors.push_back(std::fabs(static_cast<double>(it->second - h.dense_score)));
+                        }
                     }
                     if (!hits_10.empty()) {
-                        top10_overlap_sum += static_cast<double>(matched) / static_cast<double>(hits_10.size());
+                        query_overlaps.push_back(static_cast<double>(matched) / static_cast<double>(hits_10.size()));
                     }
                 }
 
@@ -490,11 +513,13 @@ int main(int argc, char* argv[]) {
             return s;
         };
 
-        summaries.push_back(eval_fp32_mode("2. Dense FP32 Only (Exact)", false));
-        summaries.push_back(evaluate_mode(engine, queries, "3. Dense SQ8 Only (INT8)", false, true));
-        summaries.push_back(eval_fp32_mode("4. Hybrid FP32 (BM25+FP32)", true));
-        summaries.push_back(evaluate_mode(engine, queries, "5. Hybrid SQ8  (1:1 RRF)", true, true, 60.0f, 1.0f, 1.0f));
-        summaries.push_back(evaluate_mode(engine, queries, "6. Hybrid SQ8  (0.3:1 W-RRF)", true, true, 60.0f, 0.3f, 1.0f));
+        summaries.push_back(eval_fp32_mode("2. Dense FP32 (1-Thread)", false));
+        summaries.push_back(evaluate_mode(engine, queries, "3a. Dense SQ8 (1-Thread)", false, true, 60.0f, 1.0f, 1.0f, 1, 5));
+        summaries.push_back(evaluate_mode(engine, queries, "3b. Dense SQ8 (OpenMP)",   false, true, 60.0f, 1.0f, 1.0f, omp_threads, 5));
+        summaries.push_back(eval_fp32_mode("4. Hybrid FP32 (1-Thread)", true));
+        summaries.push_back(evaluate_mode(engine, queries, "5a. Hybrid SQ8 (1:1, 1T)", true, true, 60.0f, 1.0f, 1.0f, 1, 5));
+        summaries.push_back(evaluate_mode(engine, queries, "5b. Hybrid SQ8 (1:1, OMP)", true, true, 60.0f, 1.0f, 1.0f, omp_threads, 5));
+        summaries.push_back(evaluate_mode(engine, queries, "6. Hybrid SQ8 (0.3:1, 1T)", true, true, 60.0f, 0.3f, 1.0f, 1, 5));
     }
 
     for (const auto& s : summaries) {
@@ -510,18 +535,65 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "====================================================================================================\n";
 
-    if (summaries.size() >= 5) {
-        const double fp32_mb = (static_cast<double>(engine.document_count()) * dim * sizeof(float)) / (1024.0 * 1024.0);
-        const double sq8_mb = static_cast<double>(engine.memory_used()) / (1024.0 * 1024.0);
-        const double overlap_pct = (top10_overlap_sum / static_cast<double>(queries.size())) * 100.0;
-        const double delta_dense_ndcg = summaries[2].ndcg_10 - summaries[1].ndcg_10;
-        const double delta_hybrid_ndcg = summaries[4].ndcg_10 - summaries[3].ndcg_10;
-        std::cout << std::fixed << std::setprecision(4)
-                  << " [P0 FP32 vs SQ8 Fidelity] Top-10 Overlap: " << std::setprecision(2) << overlap_pct << "%"
-                  << " | Dense dNDCG@10: " << std::showpos << std::setprecision(4) << delta_dense_ndcg
-                  << " | Hybrid dNDCG@10: " << delta_hybrid_ndcg << std::noshowpos
-                  << " | Vector Mem: " << std::setprecision(2) << fp32_mb << " MB (FP32) -> " << sq8_mb << " MB (SQ8)\n";
-        std::cout << "====================================================================================================\n";
+    if (summaries.size() >= 7 && !query_overlaps.empty() && !cos_abs_errors.empty()) {
+        std::sort(query_overlaps.begin(), query_overlaps.end());
+        std::sort(cos_abs_errors.begin(), cos_abs_errors.end());
+        const double mean_overlap = (std::accumulate(query_overlaps.begin(), query_overlaps.end(), 0.0) /
+                                     static_cast<double>(query_overlaps.size())) * 100.0;
+        const double p10_overlap = query_overlaps[query_overlaps.size() * 10 / 100] * 100.0;
+        const double mean_cos_err = std::accumulate(cos_abs_errors.begin(), cos_abs_errors.end(), 0.0) /
+                                    static_cast<double>(cos_abs_errors.size());
+        const double p95_cos_err = cos_abs_errors[cos_abs_errors.size() * 95 / 100];
+        const double max_cos_err = cos_abs_errors.back();
+
+        const auto mem = engine.memory_stats();
+        const double fp32_vec_mb = (static_cast<double>(engine.document_count()) * dim * sizeof(float)) / (1024.0 * 1024.0);
+        const double sq8_vec_mb = static_cast<double>(mem.vector_arena_bytes) / (1024.0 * 1024.0);
+        const double vec_meta_mb = static_cast<double>(mem.vector_meta_bytes) / (1024.0 * 1024.0);
+        const double inv_idx_mb = static_cast<double>(mem.inverted_index_bytes) / (1024.0 * 1024.0);
+        const double doc_store_mb = static_cast<double>(mem.doc_store_bytes) / (1024.0 * 1024.0);
+        const double total_idx_mb = static_cast<double>(mem.total_bytes()) / (1024.0 * 1024.0);
+
+        std::cout << std::fixed
+                  << " [SQ8 Quantization Fidelity] Top-10 Overlap Mean: " << std::setprecision(2) << mean_overlap
+                  << "% (P10: " << p10_overlap << "%) | Cosine Abs Err Mean/P95/Max: "
+                  << std::setprecision(4) << mean_cos_err << " / " << p95_cos_err << " / " << max_cos_err << "\n"
+                  << " [Index Memory Breakdown]    Raw Vectors: " << std::setprecision(2) << fp32_vec_mb << " MB (FP32) -> "
+                  << sq8_vec_mb << " MB (SQ8, 4.0x) | VecMeta: " << vec_meta_mb << " MB | InvIdx: " << inv_idx_mb
+                  << " MB | DocTexts: " << doc_store_mb << " MB | Total: " << total_idx_mb << " MB\n";
+        std::cout << "----------------------------------------------------------------------------------------------------\n";
+
+        // P3/P4: Multi-Reader Concurrent Throughput Scaling (1 / 2 / 4 / 8 / 16 Threads)
+        std::cout << " [Concurrent Multi-Reader Scaling (Hybrid SQ8 1:1, 2000 Queries Total)]\n ";
+        for (int num_readers : {1, 2, 4, 8, 16}) {
+            constexpr std::size_t kTotalConcurrentQueries = 2000;
+            std::atomic<std::size_t> next_q{0};
+            std::vector<std::thread> readers;
+            readers.reserve(static_cast<std::size_t>(num_readers));
+
+            auto t_c0 = std::chrono::high_resolution_clock::now();
+            for (int r = 0; r < num_readers; ++r) {
+                readers.emplace_back([&]() {
+                    vrag::SearchOptions c_opts;
+                    c_opts.top_k = 10;
+                    c_opts.mode = vrag::SearchMode::Hybrid;
+                    c_opts.num_threads = 1; // Each reader worker runs single-threaded scan
+                    while (true) {
+                        const std::size_t idx = next_q.fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= kTotalConcurrentQueries) break;
+                        const auto& q = queries[idx % queries.size()];
+                        auto res = engine.search(q.text, q.vector, c_opts);
+                        (void)res;
+                    }
+                });
+            }
+            for (auto& th : readers) th.join();
+            auto t_c1 = std::chrono::high_resolution_clock::now();
+            const double sec = std::chrono::duration<double>(t_c1 - t_c0).count();
+            const double conc_qps = static_cast<double>(kTotalConcurrentQueries) / sec;
+            std::cout << num_readers << "T: " << std::fixed << std::setprecision(0) << conc_qps << " QPS   ";
+        }
+        std::cout << "\n====================================================================================================\n";
     }
 
     return 0;

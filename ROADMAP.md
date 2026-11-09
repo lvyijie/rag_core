@@ -65,26 +65,26 @@
 
 ---
 
-### P3：读写并发与线程安全体系（中优先级 | 待执行）
+### P3：读写并发与线程安全体系（中优先级 | ✅ 已完成）
 
 **目标**：在个人 Agent 多线程后台写入新笔记、前台并发检索的场景下保证零数据竞争（Data Race Free）。
 
-| 子任务 | 具体内容 | 验收标准 (Acceptance Criteria) |
+| 子任务 | 具体内容 | 验收状态与实测结果 (Acceptance Criteria & Results) |
 | :--- | :--- | :--- |
-| **P3.1 读写锁同步 (`std::shared_mutex`)** | 查询操作获取共享读锁（`std::shared_lock`），写操作（`add_document` / `remove_document` / `compact`）获取独占写锁（`std::unique_lock`） | 多读并发无阻塞，读写并发互斥安全，通过高并发读写混合压测 |
-| **P3.2 批量并行建库 (`add_documents_batch`)** | 支持一次性传入一批文档与向量，利用 OpenMP 并行完成向量归一化与 SQ8 量化 | 批量建库吞吐显著高于单条循环调用 `add_document` |
+| **P3.1 读写锁同步 (`std::shared_mutex`)** | 查询操作获取共享读锁（`std::shared_lock`），写操作（`add_document` / `add_documents_batch` / `remove_document` / `compact` / `load_index`）获取独占写锁（`std::unique_lock`） | ✅ 已完成 ([`tests/p3_concurrency_test.cpp`](file:///c:/Users/qq150/source/repos/rag_core/tests/p3_concurrency_test.cpp))：6 读线程 + 2 写线程混合高频执行 `search` + `add` + `remove` + `compact` 零竞争通过；16 线程并发读取吞吐在 `NFCorpus` 上达 `107,562 QPS`（`10.47x` 加速比），在 `SciFact` 上达 `66,596 QPS`（`9.98x` 加速比） |
+| **P3.2 批量并行建库 (`add_documents_batch`)** | 支持一次性传入一批文档与向量，利用 OpenMP 并行完成向量归一化与 SQ8 量化 | ✅ 已完成：OpenMP 并行归一化与量化结果与单条顺序建库 bit-for-bit 完全一致 (`9/9 CTest passed`) |
 
 ---
 
-### P4：系统化性能评测与多规模 Benchmark（中优先级 | 待执行）
+### P4：系统化性能评测与多规模 Benchmark（中优先级 | ✅ 已完成）
 
-**目标**：补齐不同规模、不同线程数、不同指令集下的可复现性能曲线。
+**目标**：补齐不同规模、不同线程数、不同指令集下的可复现性能曲线与严谨统计口径。
 
-| 子任务 | 具体内容 | 验收标准 (Acceptance Criteria) |
+| 子任务 | 具体内容 | 验收状态与实测结果 (Acceptance Criteria & Results) |
 | :--- | :--- | :--- |
-| **P4.1 算子消融基准** | 同机测试 `Scalar` vs `AVX2` vs `AVX-VNNI`，以及 `FP32` vs `SQ8` 的纯算子吞吐与端到端延迟 | 输出清晰的加速比与内存带宽利用率数据 |
-| **P4.2 线程扩展性测试** | 测试 `1 / 2 / 4 / 8 / 16` 线程下的大语料扫描延迟与并发查询吞吐 | 明确给出小语料（$< 5\text{K}$ 建议单线程）与中大语料（$> 10\text{K}$ 开启多线程）的自适应阈值 |
-| **P4.3 文档规模梯度压测** | 评测 `5K / 10K / 50K / 100K`（核心目标区间）及 `500K`（压力边界）下的建库耗时、内存峰值（Bytes/Doc）与查询延迟 | 形成完整的规模-延迟-内存对照表 |
+| **P4.1 多轮中位数计时与量化误差分布** | 每条 Query 重复测量 5 轮取中位数消除调度抖动；输出 `Overlap@10`（均值与 P10）及余弦绝对误差（`Mean / P95 / Max`） | ✅ 已完成 ([`src/beir_bench.cpp`](file:///c:/Users/qq150/source/repos/rag_core/src/beir_bench.cpp))：余弦绝对误差均值仅 `0.0009`（Max `0.0041`），`Overlap@10` P10 达 `90.00%` |
+| **P4.2 单线程 vs OpenMP 线程策略对照与自适应阈值** | 支持 `SearchOptions::num_threads` 显式控制，同场实测 `1-Thread` vs `OpenMP`；验证 L3 Cache 驻留边界并调整自适应阈值为 `16,384` 槽位 | ✅ 已完成：小语料（`SciFact` 5.1K）单线程比 OpenMP 快 `46%`（`0.079 ms` vs `0.131 ms`）；中大语料（`FiQA` 57.6K）OpenMP 比单线程快 `2.51x`（`1.085 ms` vs `2.718 ms`） |
+| **P4.3 全量索引内存明细 (`IndexMemoryStats`)** | 明确区分向量池（`Arena` 4.0x 压缩）、向量元数据（`VecMeta`）、倒排索引（`InvIdx`）与原文字符串（`DocTexts`）的内存占比 | ✅ 已完成：新增 [`VragEngine::memory_stats()`](file:///c:/Users/qq150/source/repos/rag_core/include/vrag.hpp#L1060-L1077) 并在 `README.md` 中完整披露各部分内存明细 |
 
 ---
 

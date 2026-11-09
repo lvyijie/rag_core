@@ -11,7 +11,9 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <span>
 #include <streambuf>
 #include <string>
@@ -149,8 +151,20 @@ struct SearchOptions {
     float min_score = -1e30f;
     float bm25_k1 = 1.2f;
     float bm25_b = 0.75f;
+    int num_threads = 0; // 0 = 自适应 (>16384 槽位启用 OpenMP), 1 = 强制单线程, >1 = 指定 OpenMP 线程数
     FilterPredicate filter = nullptr;
     RerankCallback reranker = nullptr;
+};
+
+struct IndexMemoryStats {
+    std::size_t vector_arena_bytes{0};   // INT8 量化向量池活跃字节数
+    std::size_t vector_meta_bytes{0};    // 缩放因子 (scales)、偏移和 (sums_128) 与槽位映射表字节数
+    std::size_t inverted_index_bytes{0}; // 倒排词表、PostingEntry 链表与长度归一化表字节数
+    std::size_t doc_store_bytes{0};      // 原文文本与 Metadata 字符串内存字节数
+
+    [[nodiscard]] std::size_t total_bytes() const noexcept {
+        return vector_arena_bytes + vector_meta_bytes + inverted_index_bytes + doc_store_bytes;
+    }
 };
 
 class VragEngine {
@@ -166,6 +180,7 @@ public:
 
     // 从原始语料二进制包 (*.bin: UTF-8 文本 + FP32 向量) 加载并构建索引
     bool load_from_binary(const std::string& filepath) {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         std::ifstream ifs(filepath, std::ios::binary);
         if (!ifs.is_open()) {
             std::cerr << "无法打开文件: " << filepath << '\n';
@@ -212,7 +227,7 @@ public:
             if (!ifs) {
                 return false;
             }
-            add_document(doc_id, text, vec_buf);
+            add_document_unlocked(doc_id, text, vec_buf, "");
         }
 
         return true;
@@ -221,6 +236,7 @@ public:
     // 将已构建完成的索引（已量化 INT8 向量池 + 扁平倒排表 + 原文 + 元数据）直接序列化落盘
     // P2 加固：写入临时文件 (.tmp) + 64 位 FNV-1a 完整性校验和尾部 + 原子替换目标文件
     bool save_index(const std::string& filepath) const {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         if (filepath.empty()) {
             return false;
         }
@@ -427,7 +443,8 @@ public:
             }
         }
 
-        // 全部校验通过，无异常提交至当前引擎实例
+        // 全部校验通过，在独占写锁下无异常提交至当前引擎实例
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         arena_ = std::move(tmp_arena);
         inverted_index_ = std::move(tmp_inverted);
         slot_to_doc_id_ = std::move(tmp_slot_to_doc_id);
@@ -442,64 +459,117 @@ public:
         return true;
     }
 
-    // 插入或更新单篇文档 (Upsert：支持可选 metadata 属性)
+    // 插入或更新单篇文档 (Upsert：线程安全独占写锁)
     bool add_document(std::uint32_t doc_id,
                       std::string_view text,
                       std::span<const float> raw_vector,
                       std::string_view metadata = "") {
-        if (raw_vector.size() != dimension_) {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        return add_document_unlocked(doc_id, text, raw_vector, metadata);
+    }
+
+    // 批量并行插入文档（OpenMP 并行完成向量归一化与 SQ8 量化，大幅加速建库）
+    bool add_documents_batch(std::span<const std::uint32_t> doc_ids,
+                             std::span<const std::string_view> texts,
+                             std::span<const float> raw_vectors_flat,
+                             std::span<const std::string_view> metadata_list = {}) {
+        const std::size_t batch_n = doc_ids.size();
+        if (batch_n == 0) {
+            return true;
+        }
+        if (texts.size() != batch_n || raw_vectors_flat.size() != batch_n * dimension_) {
             return false;
         }
-        for (float v : raw_vector) {
+        if (!metadata_list.empty() && metadata_list.size() != batch_n) {
+            return false;
+        }
+        for (float v : raw_vectors_flat) {
             if (!std::isfinite(v)) {
                 return false;
             }
         }
 
-        auto existing = doc_id_to_slot_.find(doc_id);
-        if (existing != doc_id_to_slot_.end()) {
-            const std::uint32_t old_slot = existing->second;
-            slot_deleted_[old_slot] = 1;
-            has_deletions_ = true;
-            inverted_index_.remove_document(old_slot);
-            doc_texts_[old_slot].clear();
-            doc_texts_[old_slot].shrink_to_fit();
-            doc_metadata_[old_slot].clear();
-            doc_metadata_[old_slot].shrink_to_fit();
-            if (active_docs_ > 0) {
-                --active_docs_;
-            }
-        }
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
-        const std::uint32_t slot_id = static_cast<std::uint32_t>(slot_to_doc_id_.size());
+        // 先处理已存在 doc_id 的墓碑标记（以及本批次内重复 doc_id）
+        const std::size_t base_slot = slot_to_doc_id_.size();
+        const std::size_t target_slots = base_slot + batch_n;
+        arena_.reserve(target_slots * padded_dim_);
+        slot_to_doc_id_.resize(target_slots);
+        slot_deleted_.resize(target_slots, 0);
+        active_scales_.resize(target_slots, 0.0f);
+        active_sums_128_.resize(target_slots, 0);
+        doc_texts_.resize(target_slots);
+        doc_metadata_.resize(target_slots);
+        doc_id_to_slot_.reserve(target_slots);
+        inverted_index_.reserve_docs(target_slots);
 
-        int8_t* ptr = arena_.allocate<int8_t>(padded_dim_, 32);
-        if (!ptr) {
+        int8_t* batch_arena_ptr = arena_.allocate<int8_t>(batch_n * padded_dim_, 32);
+        if (!batch_arena_ptr) {
             return false;
         }
-        if (padded_dim_ > dimension_) {
-            std::memset(ptr + dimension_, 0, padded_dim_ - dimension_);
+
+        // 1. OpenMP 多线程并行执行向量 L2 归一化 + INT8 标量量化
+        const auto batch_signed = static_cast<std::ptrdiff_t>(batch_n);
+        const std::size_t dim = dimension_;
+        const std::size_t p_dim = padded_dim_;
+        const float* raw_base = raw_vectors_flat.data();
+
+        #pragma omp parallel for schedule(static) if(batch_n >= 128)
+        for (std::ptrdiff_t idx = 0; idx < batch_signed; ++idx) {
+            const auto u_idx = static_cast<std::size_t>(idx);
+            const std::size_t slot_id = base_slot + u_idx;
+            int8_t* dst_ptr = batch_arena_ptr + u_idx * p_dim;
+            if (p_dim > dim) {
+                std::memset(dst_ptr + dim, 0, p_dim - dim);
+            }
+            int32_t sum_128 = 0;
+            float scale = SimdInt8::normalize_and_quantize(
+                std::span<const float>(raw_base + u_idx * dim, dim),
+                std::span<int8_t>(dst_ptr, dim),
+                nullptr, nullptr, &sum_128
+            );
+            active_scales_[slot_id] = scale;
+            active_sums_128_[slot_id] = sum_128;
         }
-        std::span<int8_t> int8_span(ptr, dimension_);
 
-        int32_t sum_128 = 0;
-        float scale = SimdInt8::normalize_and_quantize(raw_vector, int8_span, nullptr, nullptr, &sum_128);
+        // 2. 更新文档槽位映射、文本存储与倒排索引
+        for (std::size_t i = 0; i < batch_n; ++i) {
+            const std::uint32_t doc_id = doc_ids[i];
+            const auto slot_id = static_cast<std::uint32_t>(base_slot + i);
 
-        slot_to_doc_id_.push_back(doc_id);
-        slot_deleted_.push_back(0);
-        active_scales_.push_back(scale);
-        active_sums_128_.push_back(sum_128);
-        doc_texts_.emplace_back(text);
-        doc_metadata_.emplace_back(metadata);
-        doc_id_to_slot_[doc_id] = slot_id;
-        ++active_docs_;
+            auto existing = doc_id_to_slot_.find(doc_id);
+            if (existing != doc_id_to_slot_.end()) {
+                const std::uint32_t old_slot = existing->second;
+                slot_deleted_[old_slot] = 1;
+                has_deletions_ = true;
+                inverted_index_.remove_document(old_slot);
+                doc_texts_[old_slot].clear();
+                doc_texts_[old_slot].shrink_to_fit();
+                doc_metadata_[old_slot].clear();
+                doc_metadata_[old_slot].shrink_to_fit();
+                if (active_docs_ > 0) {
+                    --active_docs_;
+                }
+            }
 
-        inverted_index_.add_document(slot_id, text);
+            slot_to_doc_id_[slot_id] = doc_id;
+            slot_deleted_[slot_id] = 0;
+            doc_texts_[slot_id].assign(texts[i]);
+            if (!metadata_list.empty()) {
+                doc_metadata_[slot_id].assign(metadata_list[i]);
+            }
+            doc_id_to_slot_[doc_id] = slot_id;
+            ++active_docs_;
+            inverted_index_.add_document(slot_id, texts[i]);
+        }
+
         return true;
     }
 
     // 删除指定 doc_id 的文档（O(1) 墓碑标记，立即从稀疏与稠密检索结果中剔除）
     bool remove_document(std::uint32_t doc_id) {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         auto it = doc_id_to_slot_.find(doc_id);
         if (it == doc_id_to_slot_.end()) {
             return false;
@@ -520,10 +590,12 @@ public:
     }
 
     [[nodiscard]] bool contains_document(std::uint32_t doc_id) const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         return doc_id_to_slot_.find(doc_id) != doc_id_to_slot_.end();
     }
 
     [[nodiscard]] std::string get_metadata(std::uint32_t doc_id) const {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         auto it = doc_id_to_slot_.find(doc_id);
         return (it != doc_id_to_slot_.end()) ? doc_metadata_[it->second] : std::string{};
     }
@@ -532,6 +604,7 @@ public:
     std::vector<HitResult> search(std::string_view query_text,
                                   std::span<const float> query_vector,
                                   const SearchOptions& options) const {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         if (active_docs_ == 0 || options.top_k == 0) {
             return {};
         }
@@ -629,7 +702,11 @@ public:
                 return (a.score != b.score) ? (a.score > b.score) : (a.doc_id < b.doc_id);
             };
 
-            if (total_slots <= 4096) {
+            const bool use_single_thread = (options.num_threads == 1) ||
+                                           (options.num_threads <= 0 && total_slots <= 16384);
+            const int target_threads = (options.num_threads > 1) ? options.num_threads : omp_get_max_threads();
+
+            if (use_single_thread) {
                 ws.dense_candidates.reserve(top_dense);
                 float min_top_score = -1e30f;
 
@@ -663,13 +740,15 @@ public:
                     std::sort(ws.dense_candidates.begin(), ws.dense_candidates.end(), hit_greater);
                 }
             } else {
-                const int max_threads = omp_get_max_threads();
                 auto& shared_heaps = ws.thread_heaps;
-                if (shared_heaps.size() < static_cast<std::size_t>(max_threads)) {
-                    shared_heaps.resize(max_threads);
+                if (shared_heaps.size() < static_cast<std::size_t>(target_threads)) {
+                    shared_heaps.resize(target_threads);
+                }
+                for (int t = 0; t < target_threads; ++t) {
+                    shared_heaps[t].clear();
                 }
 
-                #pragma omp parallel shared(shared_heaps)
+                #pragma omp parallel num_threads(target_threads) shared(shared_heaps)
                 {
                     const int tid = omp_get_thread_num();
                     auto& local_heap = shared_heaps[tid];
@@ -895,6 +974,7 @@ public:
 
     // 墓碑空间压缩：物理清理所有已删除/已覆盖的旧槽位，紧凑重建 Arena 向量池与倒排表
     void compact() {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         if (!has_deletions_) {
             return;
         }
@@ -953,17 +1033,107 @@ public:
         has_deletions_ = false;
     }
 
-    [[nodiscard]] std::size_t total_docs() const noexcept { return active_docs_; }
-    [[nodiscard]] std::size_t document_count() const noexcept { return active_docs_; }
-    [[nodiscard]] std::size_t total_slots() const noexcept { return slot_to_doc_id_.size(); }
+    [[nodiscard]] std::size_t total_docs() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        return active_docs_;
+    }
+    [[nodiscard]] std::size_t document_count() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        return active_docs_;
+    }
+    [[nodiscard]] std::size_t total_slots() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        return slot_to_doc_id_.size();
+    }
     [[nodiscard]] std::size_t deleted_docs() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         return slot_to_doc_id_.size() >= active_docs_ ? (slot_to_doc_id_.size() - active_docs_) : 0;
     }
     [[nodiscard]] std::size_t dimension() const noexcept { return dimension_; }
-    [[nodiscard]] std::size_t memory_used() const noexcept { return arena_.used_bytes(); }
-    [[nodiscard]] std::size_t vocab_size() const noexcept { return inverted_index_.vocab_size(); }
+    [[nodiscard]] std::size_t memory_used() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        return arena_.used_bytes();
+    }
+    [[nodiscard]] std::size_t vocab_size() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        return inverted_index_.vocab_size();
+    }
+
+    // 获取索引全量内存占用明细（区分量化向量池、向量元数据、倒排索引与文档原文存储）
+    [[nodiscard]] IndexMemoryStats memory_stats() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        IndexMemoryStats st;
+        st.vector_arena_bytes = arena_.used_bytes();
+        st.vector_meta_bytes = slot_to_doc_id_.capacity() * sizeof(std::uint32_t)
+                             + slot_deleted_.capacity() * sizeof(std::uint8_t)
+                             + active_scales_.capacity() * sizeof(float)
+                             + active_sums_128_.capacity() * sizeof(int32_t)
+                             + doc_id_to_slot_.size() * 24;
+        st.inverted_index_bytes = inverted_index_.memory_bytes();
+        for (const auto& s : doc_texts_) {
+            st.doc_store_bytes += sizeof(std::string) + s.capacity();
+        }
+        for (const auto& m : doc_metadata_) {
+            st.doc_store_bytes += sizeof(std::string) + m.capacity();
+        }
+        return st;
+    }
 
 private:
+    bool add_document_unlocked(std::uint32_t doc_id,
+                               std::string_view text,
+                               std::span<const float> raw_vector,
+                               std::string_view metadata) {
+        if (raw_vector.size() != dimension_) {
+            return false;
+        }
+        for (float v : raw_vector) {
+            if (!std::isfinite(v)) {
+                return false;
+            }
+        }
+
+        auto existing = doc_id_to_slot_.find(doc_id);
+        if (existing != doc_id_to_slot_.end()) {
+            const std::uint32_t old_slot = existing->second;
+            slot_deleted_[old_slot] = 1;
+            has_deletions_ = true;
+            inverted_index_.remove_document(old_slot);
+            doc_texts_[old_slot].clear();
+            doc_texts_[old_slot].shrink_to_fit();
+            doc_metadata_[old_slot].clear();
+            doc_metadata_[old_slot].shrink_to_fit();
+            if (active_docs_ > 0) {
+                --active_docs_;
+            }
+        }
+
+        const std::uint32_t slot_id = static_cast<std::uint32_t>(slot_to_doc_id_.size());
+
+        int8_t* ptr = arena_.allocate<int8_t>(padded_dim_, 32);
+        if (!ptr) {
+            return false;
+        }
+        if (padded_dim_ > dimension_) {
+            std::memset(ptr + dimension_, 0, padded_dim_ - dimension_);
+        }
+        std::span<int8_t> int8_span(ptr, dimension_);
+
+        int32_t sum_128 = 0;
+        float scale = SimdInt8::normalize_and_quantize(raw_vector, int8_span, nullptr, nullptr, &sum_128);
+
+        slot_to_doc_id_.push_back(doc_id);
+        slot_deleted_.push_back(0);
+        active_scales_.push_back(scale);
+        active_sums_128_.push_back(sum_128);
+        doc_texts_.emplace_back(text);
+        doc_metadata_.emplace_back(metadata);
+        doc_id_to_slot_[doc_id] = slot_id;
+        ++active_docs_;
+
+        inverted_index_.add_document(slot_id, text);
+        return true;
+    }
     static constexpr std::size_t kWorkspacePoolSize = 32;
 
     struct SearchWorkspace {
@@ -1063,6 +1233,7 @@ private:
     std::unordered_map<std::uint32_t, std::uint32_t> doc_id_to_slot_;
     std::size_t active_docs_{0};
     bool has_deletions_{false};
+    mutable std::shared_mutex rw_mutex_;
     mutable std::unique_ptr<PoolSlot[]> ws_pool_;
 };
 

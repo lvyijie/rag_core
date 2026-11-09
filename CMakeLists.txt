@@ -61,6 +61,10 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_link_libraries(p2_persistence_test PRIVATE rag_core)
     add_test(NAME p2_persistence_test COMMAND p2_persistence_test)
 
+    add_executable(p3_concurrency_test tests/p3_concurrency_test.cpp)
+    target_link_libraries(p3_concurrency_test PRIVATE rag_core)
+    add_test(NAME p3_concurrency_test COMMAND p3_concurrency_test)
+
     add_executable(real_corpus_test tests/real_corpus_test.cpp)
     target_link_libraries(real_corpus_test PRIVATE rag_core)
 

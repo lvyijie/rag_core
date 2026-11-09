@@ -494,6 +494,17 @@ public:
     [[nodiscard]] std::size_t total_docs() const noexcept { return total_docs_; }
     [[nodiscard]] std::size_t vocab_size() const noexcept { return index_.size(); }
 
+    // 估算倒排索引结构占用的内存字节数（含 PostingEntry 数组、词典节点与文档长度表）
+    [[nodiscard]] std::size_t memory_bytes() const noexcept {
+        std::size_t bytes = (doc_lengths_.capacity() + doc_k_.capacity() + doc_norm_tf1_.capacity()) * sizeof(float)
+                          + (doc_present_.capacity() + doc_deleted_.capacity()) * sizeof(std::uint8_t);
+        for (const auto& [term_id, plist] : index_) {
+            (void)term_id;
+            bytes += 32 + plist.capacity() * sizeof(PostingEntry);
+        }
+        return bytes;
+    }
+
 private:
     static constexpr std::size_t kWorkspacePoolSize = 32;
 
