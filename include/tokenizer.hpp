@@ -51,6 +51,9 @@ inline constexpr bool is_cjk_utf8(const char* p) noexcept {
     }
     const uint32_t b1 = static_cast<unsigned char>(p[1]);
     const uint32_t b2 = static_cast<unsigned char>(p[2]);
+    if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u) {
+        return false;
+    }
     const uint32_t code_point = ((b0 & 0x0Fu) << 12) | ((b1 & 0x3Fu) << 6) | (b2 & 0x3Fu);
     return is_cjk(code_point);
 }
@@ -148,22 +151,39 @@ public:
                             }
                             continue;
                         }
-                        // 3 字节非汉字（全角标点符号等）：打断滑窗并一次性跳过 3 字节
+                        // 3 字节非汉字（全角标点符号等）：若后续字节为合法 UTF-8 延续字节则跳过 3 字节，否则仅跳过当前损坏字节
                         has_prev_cjk_ = false;
-                        cur_ += 3;
+                        const auto b1 = static_cast<unsigned char>(cur_[1]);
+                        const auto b2 = static_cast<unsigned char>(cur_[2]);
+                        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
+                            cur_ += 3;
+                        } else {
+                            ++cur_;
+                        }
                         continue;
                     }
                     has_prev_cjk_ = false;
-                    cur_ = end_;
-                    break;
+                    ++cur_;
+                    continue;
                 }
 
-                // 3. 2 字节或 4 字节 UTF-8 字符（其他语种或 Emoji 符号）：打断滑窗并按字节长度跳过
+                // 3. 2 字节或 4 字节 UTF-8 字符（其他语种或 Emoji 符号）：打断滑窗并按合法延续字节长度跳过
                 has_prev_cjk_ = false;
                 if ((c & 0xE0u) == 0xC0u) {
-                    cur_ += (cur_ + 2 <= end_) ? 2 : 1;
+                    if (cur_ + 2 <= end_ && (static_cast<unsigned char>(cur_[1]) & 0xC0u) == 0x80u) {
+                        cur_ += 2;
+                    } else {
+                        ++cur_;
+                    }
                 } else if ((c & 0xF8u) == 0xF0u) {
-                    cur_ += (cur_ + 4 <= end_) ? 4 : 1;
+                    if (cur_ + 4 <= end_ &&
+                        (static_cast<unsigned char>(cur_[1]) & 0xC0u) == 0x80u &&
+                        (static_cast<unsigned char>(cur_[2]) & 0xC0u) == 0x80u &&
+                        (static_cast<unsigned char>(cur_[3]) & 0xC0u) == 0x80u) {
+                        cur_ += 4;
+                    } else {
+                        ++cur_;
+                    }
                 } else {
                     ++cur_;
                 }

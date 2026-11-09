@@ -171,11 +171,14 @@ public:
     }
 
     // 线程安全 + 零堆分配热路径：将 BM25 Top-K 结果直接写入调用方提供的复用容器
+    // allowed_mask: 可选前置过滤掩码（若非空，则仅允许 allowed_mask[doc_id] != 0 的槽位参与召回）
     void search_bm25_into(std::string_view query, std::size_t top_k,
                           std::vector<SearchHit>& results,
-                          float k1 = 1.2f, float b = 0.75f) const {
+                          float k1 = 1.2f, float b = 0.75f,
+                          const std::uint8_t* allowed_mask = nullptr) const {
         results.clear();
-        if (total_docs_ == 0 || query.empty() || top_k == 0) {
+        if (total_docs_ == 0 || query.empty() || top_k == 0 ||
+            k1 < 0.0f || b < 0.0f || b > 1.0f || !std::isfinite(k1) || !std::isfinite(b)) {
             return;
         }
 
@@ -217,13 +220,29 @@ public:
         float* __restrict scores = ws.score_buf.data();
 
         // 检查是否存在高区分度词项 (df <= 50% N)；若存在，则自动跳过 df > 50% N 的高频停用词倒排链
+        auto active_postings_df = [&](const std::vector<PostingEntry>& plist) noexcept -> std::size_t {
+            if (!check_del) {
+                return plist.size();
+            }
+            std::size_t cnt = 0;
+            for (const auto& e : plist) {
+                if (!deleted[e.doc_id]) {
+                    ++cnt;
+                }
+            }
+            return cnt;
+        };
+
         bool has_informative_term = false;
         if (ws.query_terms.size() >= 3 && total_docs_ >= 32) {
             for (std::uint32_t term_id : ws.query_terms) {
                 auto it = index_.find(term_id);
-                if (it != index_.end() && !it->second.empty() && it->second.size() * 2 <= total_docs_) {
-                    has_informative_term = true;
-                    break;
+                if (it != index_.end() && !it->second.empty()) {
+                    const std::size_t df = active_postings_df(it->second);
+                    if (df > 0 && df * 2 <= total_docs_) {
+                        has_informative_term = true;
+                        break;
+                    }
                 }
             }
         }
@@ -235,7 +254,7 @@ public:
             }
 
             const auto& postings = it->second;
-            const std::size_t df = postings.size();
+            const std::size_t df = active_postings_df(postings);
             if (df == 0 || (has_informative_term && df * 2 > total_docs_)) {
                 continue;
             }
@@ -251,7 +270,7 @@ public:
             const PostingEntry* __restrict p_data = postings.data();
             const std::size_t p_size = postings.size();
 
-            if (!check_del) {
+            if (!check_del && !allowed_mask) {
                 for (std::size_t idx = 0; idx < p_size; ++idx) {
                     const std::uint32_t doc_id = p_data[idx].doc_id;
                     const std::uint16_t raw_tf = p_data[idx].tf;
@@ -274,7 +293,7 @@ public:
             } else {
                 for (std::size_t idx = 0; idx < p_size; ++idx) {
                     const std::uint32_t doc_id = p_data[idx].doc_id;
-                    if (deleted[doc_id]) {
+                    if ((check_del && deleted[doc_id]) || (allowed_mask && !allowed_mask[doc_id])) {
                         continue;
                     }
                     const std::uint16_t raw_tf = p_data[idx].tf;
@@ -423,6 +442,51 @@ public:
         doc_norm_tf1_.clear();
         total_docs_ = 0;
         total_tokens_ = 0;
+        has_deletions_ = false;
+        norms_dirty_.store(true, std::memory_order_release);
+    }
+
+    // 根据旧槽位到新槽位的映射表紧凑重建倒排表，物理清除已删除槽位与空词项
+    void compact(const std::vector<std::uint32_t>& old_to_new_slot, std::size_t new_slot_count) {
+        std::vector<std::uint32_t> new_lengths(new_slot_count, 0);
+        std::vector<std::uint8_t> new_present(new_slot_count, 1);
+        std::vector<std::uint8_t> new_deleted(new_slot_count, 0);
+        std::size_t new_total_tokens = 0;
+
+        for (std::size_t old_s = 0; old_s < doc_lengths_.size() && old_s < old_to_new_slot.size(); ++old_s) {
+            const std::uint32_t new_s = old_to_new_slot[old_s];
+            if (new_s != UINT32_MAX) {
+                new_lengths[new_s] = doc_lengths_[old_s];
+                new_total_tokens += doc_lengths_[old_s];
+            }
+        }
+
+        for (auto it = index_.begin(); it != index_.end(); ) {
+            auto& plist = it->second;
+            std::size_t write_idx = 0;
+            for (std::size_t read_idx = 0; read_idx < plist.size(); ++read_idx) {
+                const std::uint32_t old_s = plist[read_idx].doc_id;
+                if (old_s < old_to_new_slot.size()) {
+                    const std::uint32_t new_s = old_to_new_slot[old_s];
+                    if (new_s != UINT32_MAX) {
+                        plist[write_idx++] = PostingEntry{new_s, plist[read_idx].tf};
+                    }
+                }
+            }
+            if (write_idx == 0) {
+                it = index_.erase(it);
+            } else {
+                plist.resize(write_idx);
+                plist.shrink_to_fit();
+                ++it;
+            }
+        }
+
+        doc_lengths_ = std::move(new_lengths);
+        doc_present_ = std::move(new_present);
+        doc_deleted_ = std::move(new_deleted);
+        total_docs_ = new_slot_count;
+        total_tokens_ = new_total_tokens;
         has_deletions_ = false;
         norms_dirty_.store(true, std::memory_order_release);
     }

@@ -49,6 +49,18 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_link_libraries(vrag_test PRIVATE rag_core)
     add_test(NAME vrag_test COMMAND vrag_test)
 
+    add_executable(p0_correctness_test tests/p0_correctness_test.cpp)
+    target_link_libraries(p0_correctness_test PRIVATE rag_core)
+    add_test(NAME p0_correctness_test COMMAND p0_correctness_test)
+
+    add_executable(p1_api_test tests/p1_api_test.cpp)
+    target_link_libraries(p1_api_test PRIVATE rag_core)
+    add_test(NAME p1_api_test COMMAND p1_api_test)
+
+    add_executable(p2_persistence_test tests/p2_persistence_test.cpp)
+    target_link_libraries(p2_persistence_test PRIVATE rag_core)
+    add_test(NAME p2_persistence_test COMMAND p2_persistence_test)
+
     add_executable(real_corpus_test tests/real_corpus_test.cpp)
     target_link_libraries(real_corpus_test PRIVATE rag_core)
 

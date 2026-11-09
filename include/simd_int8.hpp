@@ -252,9 +252,9 @@ public:
             if (abs_val > max_abs) max_abs = abs_val;
         }
 
-        if (max_abs == 0.0f) {
+        if (max_abs == 0.0f || !std::isfinite(max_abs)) {
             std::fill(dst.begin(), dst.end(), 0);
-            return 1.0f;
+            return 0.0f;
         }
 
         const float scale = max_abs / 127.0f;
@@ -341,12 +341,12 @@ public:
             if (abs_val > max_abs) max_abs = abs_val;
         }
 
-        if (max_abs == 0.0f || dot <= 0.0f) {
+        if (max_abs == 0.0f || dot <= 0.0f || !std::isfinite(dot) || !std::isfinite(max_abs)) {
             std::fill(dst.begin(), dst.end(), 0);
             if (dst_abs) std::fill_n(dst_abs, size, uint8_t{0});
             if (dst_u8) std::fill_n(dst_u8, size, uint8_t{128});
             if (out_sum_128) *out_sum_128 = 0;
-            return 1.0f;
+            return 0.0f;
         }
 
         const float inv_norm = 1.0f / std::sqrt(dot);

@@ -68,12 +68,24 @@ int main() {
     vrag::VragEngine engine(/*dimension=*/1024);
 
     std::vector<float> vec(1024, 0.02f);
-    engine.add_document(1, "AVX2 intrinsics accelerate int8 dot-product kernels.", vec);
+    engine.add_document(1, "AVX2 intrinsics accelerate int8 dot-product kernels.", vec, "tag:simd;lang:en");
 
-    auto hits = engine.search("AVX2 dot-product", vec, /*top_k=*/5);
+    vrag::SearchOptions opts;
+    opts.top_k = 5;
+    opts.mode = vrag::SearchMode::Hybrid;
+    opts.bm25_weight = 0.5f;
+    opts.dense_weight = 1.0f;
+    opts.filter = [](std::uint32_t /*doc_id*/, std::string_view meta) {
+        return meta.find("tag:simd") != std::string_view::npos;
+    };
+
+    auto hits = engine.search("AVX2 dot-product", vec, opts);
     for (const auto& hit : hits) {
-        std::cout << "doc_id=" << hit.doc_id << " score=" << hit.score
-                  << " text=" << hit.text << "\n";
+        std::cout << "doc_id=" << hit.doc_id
+                  << " score=" << hit.score
+                  << " (bm25=" << hit.bm25_score << " #" << hit.bm25_rank
+                  << ", dense=" << hit.dense_score << " #" << hit.dense_rank << ")"
+                  << " meta=" << hit.metadata << "\n";
     }
 
     engine.save_index("snapshot.vidx");
@@ -110,22 +122,32 @@ python scripts/run_beir_benchmark.py scifact nfcorpus arguana fiqa --hybrid-sim
 - **计时范围与预热**：数据预先加载并常驻内存，经 20 次查询预热后，单客户端串行逐条测量 `engine.search(..., top_k=10)` 的完整耗时（含 Query 分词、BM25 倒排打分、Query 向量归一化与量化、INT8 点积扫描、Top-200 候选堆维护、RRF 融合及 Top-10 结果构造），不含外部 Embedding 模型推理时间。表中 `QPS` 按 `1000 / Avg_ms` 折算，代表单流顺序吞吐率。
 - **分词与检索参数**：UTF-8 CJK Bi-gram + ASCII `[a-zA-Z0-9]+` 小写折叠（无词干提取 Stemmer），BM25 参数 `k1 = 1.2, b = 0.75`，双路等权 RRF 参数 `rrf_k = 60.0`（各取 Top-200 候选融合）；当查询词项数 `>= 3` 且存在 `df <= 50% N` 的词项时，跳过 `df > 50% N` 的高频词倒排链。
 
-### 1. 真实语义向量下的三路消融实验 (`BAAI/bge-small-en-v1.5`, 384d)
+### 1. 真实语义向量下的消融实验与 FP32 vs SQ8 精度对比 (`BAAI/bge-small-en-v1.5`, 384d)
 
-在 `BEIR/NFCorpus`（3,633 篇医学文献，323 条测试 Query）与 `BEIR/SciFact`（5,183 篇科学文献，300 条测试 Query）上，使用同一批 `BAAI/bge-small-en-v1.5` 真实语义向量对比单路稀疏、单路稠密（SQ8 量化）与双路 RRF 混合检索：
+在 `BEIR/NFCorpus`（3,633 篇医学文献，323 条测试 Query）与 `BEIR/SciFact`（5,183 篇科学文献，300 条测试 Query）上，使用同一批 `BAAI/bge-small-en-v1.5` 真实语义向量对比单路稀疏、**FP32 精确向量基线**、**SQ8 量化向量检索**与双路 RRF 混合检索：
 
 | 数据集 | 检索模式 | `NDCG@10` | `MRR@10` | `Recall@10` | `Recall@100` | 延迟 (Avg / P50 / P99) | 单流吞吐 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **NFCorpus**<br>*(3,633 docs, 384d)* | 1. BM25 Only (Sparse) | `0.3083` | `0.5140` | `0.1492` | `0.2342` | `0.018 / 0.013 / 0.088 ms` | `54,258 QPS` |
-| | 2. Dense SQ8 Only (Vector) | `0.3391` | `0.5253` | `0.1597` | `0.3056` | `0.071 / 0.068 / 0.133 ms` | `14,154 QPS` |
-| | **3. Hybrid (BM25 + SQ8 + RRF)** | **`0.3575`** | **`0.5735`** | **`0.1704`** | **`0.3142`** | `0.089 / 0.084 / 0.201 ms` | `11,176 QPS` |
-| **SciFact**<br>*(5,183 docs, 384d)* | 1. BM25 Only (Sparse) | `0.6622` | `0.6288` | `0.7889` | `0.8892` | `0.056 / 0.053 / 0.139 ms` | `17,764 QPS` |
-| | 2. Dense SQ8 Only (Vector) | **`0.7246`** | **`0.6897`** | **`0.8486`** | `0.9533` | `0.120 / 0.117 / 0.211 ms` | `8,303 QPS` |
-| | **3. Hybrid (BM25 + SQ8 + RRF)** | `0.7160` | `0.6832` | `0.8379` | **`0.9617`** | `0.165 / 0.162 / 0.239 ms` | `6,072 QPS` |
+| **NFCorpus**<br>*(3,633 docs, 384d)* | 1. BM25 Only (Sparse) | `0.3083` | `0.5140` | `0.1492` | `0.2342` | `0.018 / 0.013 / 0.073 ms` | `55,327 QPS` |
+| | 2. Dense FP32 Only (Exact) | `0.3401` | `0.5305` | `0.1612` | `0.3059` | `0.132 / 0.125 / 0.215 ms` | `7,556 QPS` |
+| | 3. Dense SQ8 Only (INT8) | `0.3391` | `0.5253` | `0.1597` | `0.3056` | `0.073 / 0.069 / 0.161 ms` | `13,688 QPS` |
+| | 4. Hybrid FP32 (BM25 + FP32) | **`0.3586`** | `0.5730` | **`0.1746`** | **`0.3161`** | `0.155 / 0.147 / 0.280 ms` | `6,470 QPS` |
+| | **5. Hybrid SQ8 (1:1 RRF)** | `0.3575` | **`0.5735`** | `0.1704` | `0.3142` | `0.091 / 0.088 / 0.172 ms` | `10,970 QPS` |
+| | 6. Hybrid SQ8 (0.3:1 W-RRF) | `0.3509` | `0.5510` | `0.1675` | `0.3120` | `0.087 / 0.083 / 0.145 ms` | `11,471 QPS` |
+| **SciFact**<br>*(5,183 docs, 384d)* | 1. BM25 Only (Sparse) | `0.6622` | `0.6288` | `0.7889` | `0.8892` | `0.057 / 0.054 / 0.191 ms` | `17,424 QPS` |
+| | 2. Dense FP32 Only (Exact) | `0.7203` | `0.6847` | `0.8452` | `0.9533` | `0.211 / 0.201 / 0.454 ms` | `4,738 QPS` |
+| | 3. Dense SQ8 Only (INT8) | `0.7246` | `0.6897` | `0.8486` | `0.9533` | `0.132 / 0.130 / 0.188 ms` | `7,571 QPS` |
+| | 4. Hybrid FP32 (BM25 + FP32) | `0.7181` | `0.6850` | `0.8412` | **`0.9617`** | `0.234 / 0.228 / 0.391 ms` | `4,272 QPS` |
+| | 5. Hybrid SQ8 (1:1 RRF) | `0.7160` | `0.6832` | `0.8379` | **`0.9617`** | `0.193 / 0.190 / 0.316 ms` | `5,193 QPS` |
+| | **6. Hybrid SQ8 (0.3:1 W-RRF)** | **`0.7264`** | **`0.6916`** | **`0.8546`** | **`0.9617`** | `0.191 / 0.188 / 0.255 ms` | `5,249 QPS` |
 
-> **消融结果观察**：
-> - 在 `NFCorpus` 上，稀疏检索（`0.3083`）与稠密检索（`0.3391`）能力相近且互补，等权 RRF 融合将 `NDCG@10` 提升至 **`0.3575`**（较 BM25 提升 `+0.0492`，较纯向量提升 `+0.0184`），`MRR@10` 提升至 **`0.5735`**。
-> - 在 `SciFact` 上，稠密模型（`0.7246`）显著强于无词干提取的 BM25（`0.6622`）；双路融合将候选集总召回率 `Recall@100` 从 `0.8892`（BM25）/ `0.9533`（Dense）提升至 **`0.9617`**，而 Top-10 排序指标 `NDCG@10`（`0.7160`）大幅优于纯 BM25（`+0.0538`），但因无权重的 1:1 RRF 受较弱一路拖累而略低于纯 Dense（`-0.0086`）。
+> **消融与量化精度观察**：
+> - **FP32 vs SQ8 量化保真度**：
+>   - **NFCorpus**：SQ8 与 FP32 精确检索的 `Top-10` 结果重合率达 **`97.34%`**，单路稠密 `NDCG@10` 仅相差 `-0.0010`（`0.3401 -> 0.3391`），混合检索 `NDCG@10` 仅相差 `-0.0011`（`0.3586 -> 0.3575`），向量内存从 `5.32 MB` 降至 `1.33 MB`（压缩 **4.0 倍**），单路扫描速度提升 **1.8x**。
+>   - **SciFact**：SQ8 与 FP32 的 `Top-10` 结果重合率达 **`97.20%`**，`Recall@100` 完全一致（`0.9533` / `0.9617`），单路稠密 `NDCG@10` 为 `0.7246`（对比 FP32 `0.7203`，`+0.0044`），向量内存从 `7.59 MB` 降至 `1.90 MB`。
+> - **等权 RRF vs 加权 Weighted RRF 增益**：
+>   - 在 `NFCorpus` 上，稀疏检索（`0.3083`）与稠密检索（`0.3391`）实力接近且高度互补，**1:1 等权 RRF** 将 `NDCG@10` 提升至 **`0.3575`**（较 BM25 提升 `+0.0492`，较纯向量提升 `+0.0184`），`MRR@10` 提升至 **`0.5735`**。
+>   - 在 `SciFact` 上，单路稠密模型（`0.7246`）显著强于无词干提取的 BM25（`0.6622`）。采用 **0.3:1 加权融合 (`Weighted RRF`, `bm25_weight = 0.3, dense_weight = 1.0`)** 后，既避免了仅靠词法命中的弱文档喧宾夺主，又保留了双路共现的精确关键词加分，使得 **`NDCG@10` 达到 `0.7264`、`MRR@10` 达到 `0.6916`、`Recall@10` 达到 `0.8546`、`Recall@100` 达到 `0.9617`，四项指标全面超越所有单路基线**。
 
 ### 2. BEIR 四大数据集纯 BM25 与 1024 维混合管线耗时 (Top-10)
 
